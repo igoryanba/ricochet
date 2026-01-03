@@ -2,7 +2,7 @@
 
 **Control your AI coding agents from Telegram**
 
-Ricochet is an MCP server that bridges your IDE (Cursor, Claude, Windsurf) with Telegram. Get notifications, answer questions, and send commands — all from your phone.
+Ricochet is an MCP server that bridges your IDE (Antigravity, Cursor, Claude, Windsurf) with Telegram and Discord. Get notifications, answer questions, and send commands — all from your phone.
 
 ![Demo](https://img.shields.io/badge/demo-coming_soon-blue)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
@@ -108,4 +108,4 @@ docker run -e TELEGRAM_BOT_TOKEN=xxx ricochet
 
 ## 📄 License
 
-MIT © 2025 Igor Yanbaev
+MIT © 2025 Igor Pryimak ([@igoryan34](https://t.me/igoryan34))
