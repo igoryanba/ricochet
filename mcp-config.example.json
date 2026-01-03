@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "ricochet": {
+      "command": "./ricochet",
+      "env": {
+        "TELEGRAM_BOT_TOKEN": "YOUR_BOT_TOKEN_HERE"
+      }
+    }
+  }
+}

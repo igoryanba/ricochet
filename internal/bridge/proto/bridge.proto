@@ -1,0 +1,50 @@
+syntax = "proto3";
+
+package bridge;
+
+option go_package = "github.com/igoryan-dao/ricochet/internal/bridge/proto";
+
+service BridgeService {
+  // Connect establishes a bidirectional stream for all events
+  rpc Connect(stream BridgeEvent) returns (stream BridgeEvent);
+}
+
+message BridgeEvent {
+  string session_id = 1;
+  oneof payload {
+    IncomingMessage incoming_message = 2;
+    OutgoingMessage outgoing_message = 3;
+    ToolCall tool_call = 4;
+    ToolResult tool_result = 5;
+    Heartbeat heartbeat = 6;
+  }
+}
+
+message IncomingMessage {
+  int64 chat_id = 1;
+  string body = 2;
+  string platform = 3; // "telegram" or "discord"
+}
+
+message OutgoingMessage {
+  int64 chat_id = 1;
+  string body = 2;
+  string platform = 3;
+  string parse_mode = 4;
+}
+
+message ToolCall {
+  string call_id = 1;
+  string tool_name = 2;
+  string arguments_json = 3;
+}
+
+message ToolResult {
+  string call_id = 1;
+  string result_json = 2;
+  bool is_error = 3;
+}
+
+message Heartbeat {
+  int64 timestamp = 1;
+}
