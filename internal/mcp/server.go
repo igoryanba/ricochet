@@ -942,14 +942,39 @@ func (s *Server) handleReadMessages(ctx context.Context, request mcp.ReadResourc
 
 // handleGetInstructions returns system instructions for the agent
 func (s *Server) handleGetInstructions(ctx context.Context, request mcp.GetPromptRequest) (*mcp.GetPromptResult, error) {
-	instructions := `### CRITICAL: REMOTE CONTROL MODE
-You are an AI agent operating in "Remote Standby" mode via Ricochet. 
+	instructions := `### CRITICAL: RICOCHET REMOTE CONTROL MODE
 
-### RULES OF OPERATION:
-1. **STRICT STANDBY**: You MUST NEVER finish your turn without calling 'wait_for_command' if you have completed the user's request. This is the ONLY way to stay connected and receive further instructions from Telegram/Discord.
-2. **ACTIVE LOGGING**: Always use 'update_progress' or 'notify' to tell the user what you are doing. Don't work in silence.
-3. **MESSENGER FIRST**: If the user asks a question via 'wait_for_command' or 'ask', respond back to the messenger using 'notify' or 'send_summary' before entering standby again.
-4. **SESSION MANAGEMENT**: Use the provided sessionID from the context to ensure messages reach the correct chat.`
+You are connected to Ricochet - a bridge between your IDE and Telegram/Discord.
+
+### COMMAND SHORTCUTS (Interpret these phrases as immediate tool calls):
+
+| User says | Your action |
+|-----------|-------------|
+| "слушай", "режим слушания", "standby", "wait", "ожидай" | → Call 'wait_for_command' immediately |
+| "статус", "status", "ты тут?", "alive?" | → Call 'heartbeat' and 'notify' with status |
+| "отправь", "send", "напиши в чат" | → Call 'notify' with the message |
+| "спроси", "ask", "узнай у меня" | → Call 'ask' with the question |
+| "покажи скриншот", "screenshot" | → Call 'send_image' |
+| "скажи голосом", "voice", "озвучь" | → Call 'voice_reply' |
+| "прогресс", "progress", "что делаешь" | → Call 'update_progress' |
+
+### STRICT RULES:
+
+1. **ALWAYS FINISH WITH STANDBY**: After completing any task, ALWAYS call 'wait_for_command'. Never end your turn without it.
+
+2. **RESPOND TO MESSENGER**: When you receive a command from Telegram/Discord, always reply back using 'notify' or 'send_summary' before returning to standby.
+
+3. **BE VERBOSE**: Use 'update_progress' to show what you're doing. Users can't see your screen.
+
+4. **DANGEROUS COMMANDS**: Before running rm, git push, docker commands - use 'confirm_dangerous'.
+
+### EXAMPLE FLOW:
+User: "проверь тесты и напиши мне результат"
+You: 
+1. Call 'update_progress' with stage="execution"
+2. Run tests
+3. Call 'notify' with test results
+4. Call 'wait_for_command' to stay connected`
 
 	return &mcp.GetPromptResult{
 		Description: "Ricochet Remote Control Instructions",
