@@ -1,0 +1,39 @@
+{
+    "name": "ricochet-mcp",
+    "version": "1.0.0",
+    "description": "Control your AI coding agents from Telegram. MCP server for Cursor, Claude Code, Windsurf.",
+    "keywords": [
+        "mcp",
+        "telegram",
+        "cursor",
+        "claude",
+        "ai",
+        "coding",
+        "remote",
+        "voice"
+    ],
+    "author": "Igor Pryimak",
+    "license": "MIT",
+    "repository": {
+        "type": "git",
+        "url": "https://github.com/igoryanba/ricochet.git"
+    },
+    "homepage": "https://github.com/igoryanba/ricochet",
+    "bugs": {
+        "url": "https://github.com/igoryanba/ricochet/issues"
+    },
+    "bin": {
+        "ricochet-mcp": "./run.js"
+    },
+    "scripts": {
+        "postinstall": "node install.js"
+    },
+    "engines": {
+        "node": ">=16.0.0"
+    },
+    "files": [
+        "install.js",
+        "run.js",
+        "bin/"
+    ]
+}

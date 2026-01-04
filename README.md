@@ -2,9 +2,9 @@
 
 **Control your AI coding agents from Telegram**
 
-Ricochet is an MCP server that bridges your IDE (Antigravity, Cursor, Claude, Windsurf) with Telegram and Discord. Get notifications, answer questions, and send commands — all from your phone.
+Ricochet is an MCP server that bridges your IDE (Cursor, Claude Code, Windsurf, Antigravity) with Telegram and Discord. Get notifications, answer questions, and send commands — all from your phone.
 
-![Demo](https://img.shields.io/badge/demo-coming_soon-blue)
+[![npm version](https://img.shields.io/npm/v/ricochet-mcp.svg)](https://www.npmjs.com/package/ricochet-mcp)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Go](https://img.shields.io/badge/Go-1.21+-00ADD8?logo=go)](https://go.dev)
 
@@ -22,18 +22,68 @@ Ricochet is an MCP server that bridges your IDE (Antigravity, Cursor, Claude, Wi
 
 ## 📦 Installation
 
-### Option 1: Download Binary (Recommended)
+### Claude Code (One command!)
+
 ```bash
-# Download latest release for your OS
-curl -L https://github.com/igoryanba/ricochet/releases/latest/download/ricochet-darwin-arm64 -o ricochet
-chmod +x ricochet
+claude mcp add ricochet -- npx -y ricochet-mcp
 ```
 
-### Option 2: Build from Source
+Then set your bot token:
 ```bash
-git clone https://github.com/igoryanba/ricochet.git
-cd ricochet
-go build -o ricochet ./cmd/ricochet
+claude mcp add ricochet -- npx -y ricochet-mcp --env TELEGRAM_BOT_TOKEN=your_token
+```
+
+### Cursor
+
+Add to `~/.cursor/mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "ricochet": {
+      "command": "npx",
+      "args": ["-y", "ricochet-mcp"],
+      "env": {
+        "TELEGRAM_BOT_TOKEN": "your_token_here"
+      }
+    }
+  }
+}
+```
+
+### Claude Desktop
+
+Add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
+
+```json
+{
+  "mcpServers": {
+    "ricochet": {
+      "command": "npx",
+      "args": ["-y", "ricochet-mcp"],
+      "env": {
+        "TELEGRAM_BOT_TOKEN": "your_token_here"
+      }
+    }
+  }
+}
+```
+
+### Alternative: Download Binary
+
+```bash
+# macOS Apple Silicon
+curl -L https://github.com/igoryanba/ricochet/releases/latest/download/ricochet-darwin-arm64 -o ricochet
+chmod +x ricochet
+
+# macOS Intel
+curl -L https://github.com/igoryanba/ricochet/releases/latest/download/ricochet-darwin-amd64 -o ricochet
+
+# Linux
+curl -L https://github.com/igoryanba/ricochet/releases/latest/download/ricochet-linux-amd64 -o ricochet
+
+# Windows
+curl -L https://github.com/igoryanba/ricochet/releases/latest/download/ricochet-windows-amd64.exe -o ricochet.exe
 ```
 
 ---
@@ -45,30 +95,9 @@ go build -o ricochet ./cmd/ricochet
 2. Send `/newbot` and follow instructions
 3. Copy your bot token
 
-### 2. Configure
-```bash
-export TELEGRAM_BOT_TOKEN="your_token_here"
-```
+### 2. Add to your IDE (see above)
 
-### 3. Add to your IDE
-Run the auto-installer:
-```bash
-./ricochet install
-```
-
-Or manually add to your MCP config (`~/.cursor/mcp.json`):
-```json
-{
-  "mcpServers": {
-    "ricochet": {
-      "command": "/path/to/ricochet",
-      "env": {
-        "TELEGRAM_BOT_TOKEN": "your_token_here"
-      }
-    }
-  }
-}
-```
+### 3. Restart your IDE
 
 ### 4. Start chatting! 🎉
 Open your bot in Telegram and send `/start`.
@@ -83,8 +112,11 @@ Open your bot in Telegram and send `/start`.
 | `ask` | Ask a question and wait for answer |
 | `confirm_dangerous` | Request approval for dangerous commands |
 | `send_image` | Send screenshots to chat |
+| `send_code_block` | Send formatted code with syntax highlighting |
 | `voice_reply` | Send voice message (TTS) |
+| `update_progress` | Send progress updates (planning/execution/verification) |
 | `wait_for_command` | Enter standby mode, wait for user input |
+| `browser_search` | Search the web via DuckDuckGo |
 
 ---
 
@@ -102,6 +134,16 @@ Run Ricochet without an IDE:
 ```bash
 docker build -t ricochet .
 docker run -e TELEGRAM_BOT_TOKEN=xxx ricochet
+```
+
+---
+
+## 🔧 Build from Source
+
+```bash
+git clone https://github.com/igoryanba/ricochet.git
+cd ricochet
+go build -o ricochet ./cmd/ricochet
 ```
 
 ---
