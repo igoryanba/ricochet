@@ -691,7 +691,7 @@ func (s *Server) handleWaitForCommand(ctx context.Context, request mcp.CallToolR
 			tg.SetActiveSession(chatID, sessionID)
 		}
 
-		tg.SendMessage(ctx, chatID, "💤 **Агент перешел в режим ожидания.** Пришлите следующую команду, когда будете готовы.")
+		tg.SendMessage(ctx, chatID, "💤 **Agent in standby.** Send next command when ready.")
 	}
 
 	log.Printf("Session %s entering wait mode...", sessionID)
@@ -1055,7 +1055,7 @@ func (s *Server) handleCallback(ctx context.Context, cb *telegram.CallbackEvent)
 		s.sendChatHistory(ctx, cb.ChatID)
 
 	case cb.Data == telegram.CallbackNewChat:
-		s.tgBot.SendMessage(ctx, cb.ChatID, "➕ Для создания нового чата откройте Antigravity и начните новый разговор с агентом.")
+		s.tgBot.SendMessage(ctx, cb.ChatID, "➕ To create a new chat, open IDE and start a new conversation with the agent.")
 
 	case strings.HasPrefix(cb.Data, "session:"):
 		sessionID := strings.TrimPrefix(cb.Data, "session:")
@@ -1066,9 +1066,9 @@ func (s *Server) handleCallback(ctx context.Context, cb *telegram.CallbackEvent)
 		s.tgBot.SetActiveSession(cb.ChatID, sessionID)
 
 		online := s.tgBot.IsSessionOnline(sessionID)
-		statusStr := "⚠️ Оффлайн (откройте этот проект в Antigravity)"
+		statusStr := "⚠️ Offline (open this project in IDE)"
 		if online {
-			statusStr = "🟢 В сети (готов к работе)"
+			statusStr = "🟢 Online (ready to work)"
 		}
 
 		sess, _ := s.sessionsMgr.GetSession(sessionID)
@@ -1077,11 +1077,11 @@ func (s *Server) handleCallback(ctx context.Context, cb *telegram.CallbackEvent)
 			title = sess.Title
 		}
 
-		msg := fmt.Sprintf("📍 **Сессия активирована:** %s\nСтатус: %s\n\n", title, statusStr)
+		msg := fmt.Sprintf("📍 **Session activated:** %s\nStatus: %s\n\n", title, statusStr)
 		if online {
-			msg += "Чтобы запустить агента, **просто напишите ваш вопрос или команду первым в этот чат**, и он мгновенно ответит!"
+			msg += "To start the agent, **simply type your question or command in this chat**, and it will respond instantly!"
 		} else {
-			msg += "Чтобы начать работу, **откройте соответствующий Workspace в Antigravity на вашем компьютере**. После этого я смогу принимать команды."
+			msg += "To start working, **open the corresponding Workspace in IDE on your computer**. After that, I'll be able to accept commands."
 		}
 		s.tgBot.SendMessage(ctx, cb.ChatID, msg)
 
@@ -1103,18 +1103,18 @@ func (s *Server) sendChatHistory(ctx context.Context, chatID int64) {
 	sessionsList, err := s.sessionsMgr.GetSessions(15) // Limit to 15 recent sessions for bot UI
 	if err != nil {
 		log.Printf("Failed to get sessions: %v", err)
-		s.tgBot.SendMessage(ctx, chatID, "❌ Не удалось загрузить историю сессий")
+		s.tgBot.SendMessage(ctx, chatID, "❌ Failed to load session history")
 		return
 	}
 
 	groups := s.sessionsMgr.GroupByWorkspace(sessionsList)
 	if len(groups) == 0 {
-		s.tgBot.SendMessage(ctx, chatID, "📭 Нет сохранённых сессий (с планом или отчетом)")
+		s.tgBot.SendMessage(ctx, chatID, "📭 No saved sessions (with plan or report)")
 		return
 	}
 
 	var sb strings.Builder
-	sb.WriteString("📋 **Ваши сессии по проектам:**\n")
+	sb.WriteString("📋 **Your sessions by project:**\n")
 
 	var buttons [][]telegram.ButtonConfig
 
@@ -1142,7 +1142,7 @@ func (s *Server) sendChatHistory(ctx context.Context, chatID int64) {
 		}
 	}
 
-	sb.WriteString("\n─────────────────\n💡 Нажмите на кнопку ниже, чтобы увидеть детали сессии.")
+	sb.WriteString("\n─────────────────\n💡 Click a button below to see session details.")
 
 	if err := s.tgBot.SendMessageWithButtons(ctx, chatID, sb.String(), buttons); err != nil {
 		log.Printf("Failed to send chat history with buttons: %v", err)
@@ -1155,33 +1155,33 @@ func (s *Server) sendChatHistory(ctx context.Context, chatID int64) {
 func (s *Server) sendSessionDetails(ctx context.Context, chatID int64, sessionID string) {
 	sess, err := s.sessionsMgr.GetSession(sessionID)
 	if err != nil {
-		s.tgBot.SendMessage(ctx, chatID, "❌ Сессия не найдена")
+		s.tgBot.SendMessage(ctx, chatID, "❌ Session not found")
 		return
 	}
 
-	status := "В процессе"
+	status := "In progress"
 	if sess.HasWalkthrough {
-		status = "Завершена ✅"
+		status = "Completed ✅"
 	} else if sess.HasPlan {
-		status = "Планирование 📝"
+		status = "Planning 📝"
 	}
 
-	msg := fmt.Sprintf("📄 **Детали сессии**\n\n"+
-		"**Название:** %s\n"+
-		"**Проект:** %s\n"+
-		"**Статус:** %s\n"+
-		"**Обновлено:** %s\n\n"+
-		"**Кратко:**\n%s\n\n"+
+	msg := fmt.Sprintf("📄 **Session Details**\n\n"+
+		"**Title:** %s\n"+
+		"**Project:** %s\n"+
+		"**Status:** %s\n"+
+		"**Updated:** %s\n\n"+
+		"**Summary:**\n%s\n\n"+
 		"─────────────────\n"+
-		"Чтобы продолжить эту работу, откройте Antigravity и выберите данный чат в Inbox.",
+		"To continue this work, open IDE and select this chat in Inbox.",
 		sess.Title, sess.Workspace, status, sessions.FormatTimeAgo(sess.UpdatedAt), sess.Summary)
 
 	s.tgBot.SendMessageWithButtons(ctx, chatID, msg, [][]telegram.ButtonConfig{
 		{
-			{Text: "📍 Активировать этот чат", Data: "activate:" + sessionID},
+			{Text: "📍 Activate this chat", Data: "activate:" + sessionID},
 		},
 		{
-			{Text: "🔙 К списку", Data: telegram.CallbackChatHistory},
+			{Text: "🔙 Back to list", Data: telegram.CallbackChatHistory},
 		},
 	})
 }

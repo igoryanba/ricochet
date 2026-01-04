@@ -32,7 +32,17 @@ func main() {
 		}
 	}
 
-	// 2. Default mode: Run MCP Server
+	// 2. Check if running interactively (double-clicked exe)
+	// If stdin is not a pipe/MCP connection, show help instead of hanging
+	stat, _ := os.Stdin.Stat()
+	if (stat.Mode() & os.ModeCharDevice) != 0 {
+		// Running in terminal/interactive mode without subcommand
+		// This happens when user double-clicks the exe on Windows
+		printInteractiveHelp()
+		return
+	}
+
+	// 3. Default mode: Run MCP Server (stdin/stdout for IDE)
 	runServer()
 }
 
@@ -65,6 +75,35 @@ func printHelp() {
 	fmt.Println("  ricochet          Run MCP Server (stdio mode)")
 	fmt.Println("  ricochet install  Automatically configure MCP in Cursor, Claude Desktop, Claude Code, etc.")
 	fmt.Println("  ricochet help     Show this help")
+}
+
+func printInteractiveHelp() {
+	fmt.Println("╔═══════════════════════════════════════════════════════════════╗")
+	fmt.Println("║           🚀 Ricochet - Control IDE from Telegram            ║")
+	fmt.Println("╚═══════════════════════════════════════════════════════════════╝")
+	fmt.Println("")
+	fmt.Println("  Ricochet is an MCP server that bridges your IDE with Telegram.")
+	fmt.Println("  It runs automatically when your IDE starts.")
+	fmt.Println("")
+	fmt.Println("  📦 INSTALLATION:")
+	fmt.Println("  ────────────────")
+	fmt.Println("  1. Set your Telegram bot token:")
+	fmt.Println("     export TELEGRAM_BOT_TOKEN=\"your_token_here\"")
+	fmt.Println("")
+	fmt.Println("  2. Run the installer:")
+	fmt.Println("     ./ricochet install")
+	fmt.Println("")
+	fmt.Println("  3. Restart your IDE (Cursor, Claude Code, etc.)")
+	fmt.Println("")
+	fmt.Println("  📖 MANUAL:")
+	fmt.Println("  ──────────")
+	fmt.Println("  ricochet install  - Configure MCP in all detected IDEs")
+	fmt.Println("  ricochet help     - Show command help")
+	fmt.Println("")
+	fmt.Println("  🌐 GitHub: https://github.com/igoryanba/ricochet")
+	fmt.Println("")
+	fmt.Println("Press Enter to exit...")
+	fmt.Scanln()
 }
 
 func runServer() {
