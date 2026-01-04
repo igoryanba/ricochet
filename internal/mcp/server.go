@@ -1052,7 +1052,8 @@ func (s *Server) handleCallback(ctx context.Context, cb *telegram.CallbackEvent)
 
 	switch {
 	case cb.Data == telegram.CallbackChatHistory:
-		s.sendChatHistory(ctx, cb.ChatID)
+		activeID := s.tgBot.GetActiveSession(cb.ChatID)
+		s.sendChatHistory(ctx, cb.ChatID, activeID)
 
 	case cb.Data == telegram.CallbackNewChat:
 		s.tgBot.SendMessage(ctx, cb.ChatID, "➕ To create a new chat, open IDE and start a new conversation with the agent.")
@@ -1099,7 +1100,8 @@ func (s *Server) handleCallback(ctx context.Context, cb *telegram.CallbackEvent)
 }
 
 // sendChatHistory sends list of recent sessions grouped by workspace
-func (s *Server) sendChatHistory(ctx context.Context, chatID int64) {
+// sendChatHistory sends list of recent sessions grouped by workspace
+func (s *Server) sendChatHistory(ctx context.Context, chatID int64, activeSessionID string) {
 	sessionsList, err := s.sessionsMgr.GetSessions(15) // Limit to 15 recent sessions for bot UI
 	if err != nil {
 		log.Printf("Failed to get sessions: %v", err)
@@ -1129,13 +1131,37 @@ func (s *Server) sendChatHistory(ctx context.Context, chatID int64) {
 				status = "📝"
 			}
 
+			isActive := sess.ID == activeSessionID
+
+			// Visual markers for text message
+			prefix := "- "
+			if isActive {
+				prefix = "👉 " // Pointer for active session
+				status = "🟢"  // Green circle for active
+			}
+
 			timeAgo := sessions.FormatTimeAgo(sess.UpdatedAt)
-			sb.WriteString(fmt.Sprintf("- %s %s (%s)\n", status, sess.Title, timeAgo))
+			sb.WriteString(fmt.Sprintf("%s%s %s (%s)\n", prefix, status, sess.Title, timeAgo))
+
+			// Button text with short time
+			shortTime := sessions.FormatShortTimeAgo(sess.UpdatedAt)
+
+			// Visual markers for button
+			btnStatus := status
+			if isActive {
+				btnStatus = "🟢"
+			}
+
+			// Truncate title for button if too long
+			btnTitle := sess.Title
+			if len(btnTitle) > 30 {
+				btnTitle = btnTitle[:29] + "…"
+			}
 
 			// Add button for this session
 			buttons = append(buttons, []telegram.ButtonConfig{
 				{
-					Text: fmt.Sprintf("%s %s", status, sess.Title),
+					Text: fmt.Sprintf("%s %s (%s)", btnStatus, btnTitle, shortTime),
 					Data: "session:" + sess.ID,
 				},
 			})

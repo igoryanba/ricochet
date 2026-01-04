@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io/fs"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
@@ -77,13 +78,14 @@ func (m *Manager) GetSessions(limit int) ([]Session, error) {
 		// Try to read artifacts to find workspace and information
 		m.enrichSession(sessionDir, &session)
 
-		// Only include sessions with some content
-		if session.HasTask || session.HasPlan || session.HasWalkthrough {
-			if session.Title == "" {
-				session.Title = "Session " + sessionID[:8]
-			}
-			sessions = append(sessions, session)
+		// Include session if it has Title (found from markdown) OR has any known artifacts OR just has a session ID
+		// To avoid empty junk sessions, let's say we include it if we managed to find a Title OR it has artifacts.
+		// If Title is still empty, fallback to ID.
+		if session.Title == "" {
+			session.Title = "Chat " + sessionID[:8]
 		}
+
+		sessions = append(sessions, session)
 	}
 
 	// Sort by UpdatedAt descending (newest first)
@@ -101,20 +103,31 @@ func (m *Manager) GetSessions(limit int) ([]Session, error) {
 
 // enrichSession reads artifacts to fill session details
 func (m *Manager) enrichSession(sessionDir string, session *Session) {
-	// 1. Check for artifacts
-	artifacts := []string{"walkthrough.md", "implementation_plan.md", "task.md"}
-	for _, art := range artifacts {
-		path := filepath.Join(sessionDir, art)
-		content, err := os.ReadFile(path)
-		if err != nil {
+	// Scan all files in directory
+	entries, err := os.ReadDir(sessionDir)
+	if err != nil {
+		return
+	}
+
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".md") {
 			continue
 		}
 
-		switch art {
+		// Read file content
+		path := filepath.Join(sessionDir, entry.Name())
+		contentBytes, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		content := string(contentBytes)
+
+		// Check for specific artifact types
+		switch entry.Name() {
 		case "task.md":
 			session.HasTask = true
-			if session.Title == "" {
-				session.Title = extractTitle(string(content))
+			if session.Title == "" || session.Title == "Chat "+session.ID[:8] {
+				session.Title = extractTitle(content)
 			}
 		case "implementation_plan.md":
 			session.HasPlan = true
@@ -122,9 +135,17 @@ func (m *Manager) enrichSession(sessionDir string, session *Session) {
 			session.HasWalkthrough = true
 		}
 
-		// Try to detect workspace from file links
+		// Use title from other MD files if still empty
+		if session.Title == "" || strings.HasPrefix(session.Title, "Chat ") {
+			title := extractTitle(content)
+			if title != "" {
+				session.Title = title
+			}
+		}
+
+		// Try to detect workspace from file links in ANY file
 		if session.Workspace == "Global" || session.Workspace == "" {
-			ws := detectWorkspace(string(content))
+			ws := detectWorkspace(content)
 			if ws != "" {
 				session.Workspace = ws
 			}
@@ -133,7 +154,7 @@ func (m *Manager) enrichSession(sessionDir string, session *Session) {
 		// Read metadata if available
 		metaPath := path + ".metadata.json"
 		if meta, err := readMetadata(metaPath); err == nil {
-			if session.Summary == "" || (art == "walkthrough.md" && len(meta.Summary) > 50) {
+			if session.Summary == "" || (entry.Name() == "walkthrough.md" && len(meta.Summary) > 50) {
 				session.Summary = meta.Summary
 			}
 			if t, err := time.Parse(time.RFC3339, meta.UpdatedAt); err == nil {
@@ -165,7 +186,14 @@ func detectWorkspace(content string) string {
 	// parts[0] is username, parts[1] is project or Documents/Desktop
 	for i := 1; i < len(parts); i++ {
 		p := parts[i]
-		p = strings.ReplaceAll(p, "%20", " ")
+
+		// Decode URL encoding (e.g. %20, %5B, %5D)
+		if decoded, err := url.QueryUnescape(p); err == nil {
+			p = decoded
+		} else {
+			p = strings.ReplaceAll(p, "%20", " ")
+		}
+
 		if p == "" || p == "Documents" || p == "Desktop" || p == "Downloads" || p == "Source" || p == "Work" {
 			continue
 		}
@@ -282,6 +310,24 @@ func FormatTimeAgo(t time.Time) string {
 		return formatPlural(days, "день", "дня", "дней") + " назад"
 	default:
 		return t.Format("02.01.2006")
+	}
+}
+
+// FormatShortTimeAgo returns short formatted time for buttons
+func FormatShortTimeAgo(t time.Time) string {
+	diff := time.Since(t)
+
+	switch {
+	case diff < time.Minute:
+		return "now"
+	case diff < time.Hour:
+		return fmt.Sprintf("%dm", int(diff.Minutes()))
+	case diff < 24*time.Hour:
+		return fmt.Sprintf("%dh", int(diff.Hours()))
+	case diff < 7*24*time.Hour:
+		return fmt.Sprintf("%dd", int(diff.Hours()/24))
+	default:
+		return t.Format("02.01")
 	}
 }
 
