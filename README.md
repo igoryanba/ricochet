@@ -104,6 +104,19 @@ Open your bot in Telegram and send `/start`.
 
 ---
 
+## 🪟 Windows Users
+
+**Important**: If `ricochet.exe` closes immediately, you need to run the installer first:
+
+```powershell
+$env:TELEGRAM_BOT_TOKEN="your_token_here"
+.\ricochet.exe install
+```
+
+Then restart your IDE. See [Windows Setup Guide](docs/WINDOWS.md) for detailed instructions.
+
+---
+
 ## 🧰 MCP Tools
 
 | Tool | Description |

@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"os/exec"
 	"os/signal"
+	"runtime"
 	"syscall"
 
 	"github.com/igoryan-dao/ricochet/internal/bridge"
@@ -143,26 +145,8 @@ func runServer() {
 		log.Fatalf("Failed to create Telegram bot: %v", err)
 	}
 
-	// Initialize Whisper transcriber
-	// Check for env vars (useful for Docker), fallback to local Mac paths
-	whisperPath := os.Getenv("WHISPER_PATH")
-	if whisperPath == "" {
-		whisperPath = "/Users/igoryan_dao/Ricochet/third_party/whisper.cpp/build/bin/whisper-cli"
-	}
-
-	modelPath := os.Getenv("WHISPER_MODEL_PATH")
-	if modelPath == "" {
-		modelPath = "/Users/igoryan_dao/Ricochet/third_party/whisper.cpp/models/ggml-base.bin"
-	}
-
-	log.Printf("Initializing Whisper with binary: %s, model: %s", whisperPath, modelPath)
-	transcriber, err := whisper.NewTranscriber(whisperPath, modelPath)
-	if err != nil {
-		log.Printf("Warning: Failed to initialize Whisper: %v. Voice commands will be disabled.", err)
-	} else {
-		tgBot.SetTranscriber(transcriber)
-		log.Println("Whisper transcriber initialized successfully")
-	}
+	// Initialize Whisper transcriber (optional feature)
+	initializeWhisper(tgBot)
 
 	// Initialize Discord bot if token is provided
 	var discordBot *discord.Bot
@@ -219,4 +203,86 @@ func runServer() {
 			log.Fatalf("MCP server error: %v", err)
 		}
 	}
+}
+
+// initializeWhisper attempts to initialize Whisper transcriber
+// This is an optional feature - if it fails, voice commands are disabled but the app continues
+func initializeWhisper(tgBot *telegram.Bot) {
+	whisperPath := os.Getenv("WHISPER_PATH")
+	modelPath := os.Getenv("WHISPER_MODEL_PATH")
+
+	// Try to find Whisper if not explicitly set
+	if whisperPath == "" {
+		whisperPath = findWhisperBinary()
+		if whisperPath == "" {
+			log.Println("Whisper not found. Voice transcription disabled. Set WHISPER_PATH to enable.")
+			return
+		}
+	}
+
+	// Model path is required if binary is set
+	if modelPath == "" {
+		log.Println("WHISPER_MODEL_PATH not set. Voice transcription disabled.")
+		return
+	}
+
+	// Validate paths exist
+	if _, err := os.Stat(whisperPath); os.IsNotExist(err) {
+		log.Printf("Warning: Whisper binary not found at %s. Voice commands disabled.", whisperPath)
+		return
+	}
+	if _, err := os.Stat(modelPath); os.IsNotExist(err) {
+		log.Printf("Warning: Whisper model not found at %s. Voice commands disabled.", modelPath)
+		return
+	}
+
+	// Check if FFmpeg is available (required for voice message conversion)
+	if _, err := exec.LookPath("ffmpeg"); err != nil {
+		log.Println("Warning: FFmpeg not found. Voice transcription requires FFmpeg. Install it to enable voice commands.")
+		return
+	}
+
+	// Try to initialize transcriber
+	log.Printf("Initializing Whisper with binary: %s, model: %s", whisperPath, modelPath)
+	transcriber, err := whisper.NewTranscriber(whisperPath, modelPath)
+	if err != nil {
+		log.Printf("Warning: Failed to initialize Whisper: %v. Voice commands disabled.", err)
+		return
+	}
+
+	tgBot.SetTranscriber(transcriber)
+	log.Println("Whisper transcriber initialized successfully")
+}
+
+// findWhisperBinary looks for whisper-cli in common locations
+func findWhisperBinary() string {
+	var candidates []string
+
+	switch runtime.GOOS {
+	case "darwin":
+		homeDir, _ := os.UserHomeDir()
+		candidates = []string{
+			"/usr/local/bin/whisper-cli",
+			"/opt/homebrew/bin/whisper-cli",
+			homeDir + "/Ricochet/third_party/whisper.cpp/build/bin/whisper-cli",
+		}
+	case "linux":
+		candidates = []string{
+			"/usr/local/bin/whisper-cli",
+			"/usr/bin/whisper-cli",
+		}
+	case "windows":
+		candidates = []string{
+			"C:\\Program Files\\whisper\\whisper-cli.exe",
+			"C:\\whisper\\whisper-cli.exe",
+		}
+	}
+
+	for _, path := range candidates {
+		if _, err := os.Stat(path); err == nil {
+			return path
+		}
+	}
+
+	return ""
 }
