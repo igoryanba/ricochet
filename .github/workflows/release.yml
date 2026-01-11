@@ -114,6 +114,16 @@ jobs:
           rm -rf core-*
           chmod +x */ricochet-core*
 
+      - name: Prepare Package Assets
+        run: |
+          # Copy README and License to extension folder so vsce sees them
+          cp README.md extension-vscode/
+          cp LICENSE extension-vscode/
+          cp GOVERNANCE.md extension-vscode/ || true
+          
+          # Ensure assets exist
+          ls -F extension-vscode/assets/icon.png
+
       - name: Package VSIX
         run: |
           cd extension-vscode
