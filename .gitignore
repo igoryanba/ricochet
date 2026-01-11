@@ -1,0 +1,33 @@
+# Dependencies
+node_modules/
+vendor/
+
+# Build outputs
+dist/
+bin/
+webview-dist/
+out/
+*.exe
+ricochet-core
+
+# IDE
+.idea/
+*.swp
+.DS_Store
+
+# Logs
+*.log
+
+# API Keys - NEVER COMMIT REAL KEYS!
+.env.keys
+*.keys
+.env.local
+*.local
+config/.env.local
+core/config/.env.local
+
+# Local config
+.ricochet/
+
+# OS
+Thumbs.db

@@ -1,0 +1,160 @@
+package host
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"os"
+	"sync"
+	"time"
+
+	"github.com/igoryan-dao/ricochet/internal/protocol"
+)
+
+// StdioHost implements Host by communicating with a parent process over stdio.
+// This is used when Ricochet runs as a VSCode extension sidecar.
+type StdioHost struct {
+	cwd             string
+	orchestrator    *CommandOrchestrator
+	outputMu        sync.Mutex
+	pendingRequests map[string]chan string
+	mu              sync.Mutex
+}
+
+func NewStdioHost(cwd string) *StdioHost {
+	return &StdioHost{
+		cwd:             cwd,
+		orchestrator:    NewCommandOrchestrator(cwd),
+		pendingRequests: make(map[string]chan string),
+	}
+}
+
+func (h *StdioHost) GetCWD() string {
+	return h.cwd
+}
+
+func (h *StdioHost) ReadFile(path string) ([]byte, error) {
+	// Local file system access is still fine for sidecar
+	return os.ReadFile(h.resolve(path))
+}
+
+func (h *StdioHost) WriteFile(path string, data []byte) error {
+	return os.WriteFile(h.resolve(path), data, 0644)
+}
+
+func (h *StdioHost) ListDir(path string) ([]FileInfo, error) {
+	entries, err := os.ReadDir(h.resolve(path))
+	if err != nil {
+		return nil, err
+	}
+	var infos []FileInfo
+	for _, entry := range entries {
+		info, _ := entry.Info()
+		infos = append(infos, FileInfo{
+			Name:  entry.Name(),
+			Size:  info.Size(),
+			IsDir: entry.IsDir(),
+		})
+	}
+	return infos, nil
+}
+
+func (h *StdioHost) ExecuteCommand(ctx context.Context, command string, background bool) (CommandResult, error) {
+	state, err := h.orchestrator.Execute(ctx, command, background)
+	if err != nil {
+		return CommandResult{}, err
+	}
+	return CommandResult{ID: state.ID, Output: state.Output}, nil
+}
+
+func (h *StdioHost) GetCommandStatus(id string) (CommandStatus, bool) {
+	state, ok := h.orchestrator.GetStatus(id)
+	if !ok {
+		return CommandStatus{}, false
+	}
+	return CommandStatus{
+		ID:     state.ID,
+		Status: string(state.Status),
+		Output: state.Output,
+	}, true
+}
+
+func (h *StdioHost) ShowMessage(level string, text string) {
+	h.sendNotification("show_message", map[string]string{
+		"level": level,
+		"text":  text,
+	})
+}
+
+func (h *StdioHost) AskUser(question string) (string, error) {
+	id := fmt.Sprintf("req-%d", time.Now().UnixNano()) // Simple unique ID
+	return h.AskUserWithID(question, id)
+}
+
+func (h *StdioHost) AskUserWithID(question string, id string) (string, error) {
+	ch := make(chan string)
+	h.mu.Lock()
+	h.pendingRequests[id] = ch
+	h.mu.Unlock()
+
+	defer func() {
+		h.mu.Lock()
+		delete(h.pendingRequests, id)
+		h.mu.Unlock()
+	}()
+
+	h.sendRequest("ask_user", id, map[string]string{
+		"question": question,
+	})
+
+	select {
+	case response := <-ch:
+		return response, nil
+	case <-time.After(5 * time.Minute):
+		return "", fmt.Errorf("user response timeout")
+	}
+}
+
+func (h *StdioHost) HandleResponse(id string, payload string) {
+	h.mu.Lock()
+	ch, ok := h.pendingRequests[id]
+	h.mu.Unlock()
+
+	if ok {
+		ch <- payload
+	}
+}
+
+func (h *StdioHost) resolve(path string) string {
+	if os.IsPathSeparator(path[0]) {
+		return path
+	}
+	return h.cwd + "/" + path
+}
+
+func (h *StdioHost) sendNotification(msgType string, payload interface{}) {
+	h.send("notification", msgType, "", payload)
+}
+
+func (h *StdioHost) sendRequest(msgType string, id string, payload interface{}) {
+	h.send("request", msgType, id, payload)
+}
+
+func (h *StdioHost) SendMessage(msg protocol.RPCMessage) {
+	h.outputMu.Lock()
+	defer h.outputMu.Unlock()
+
+	data, _ := json.Marshal(msg)
+	fmt.Println(string(data))
+}
+
+func (h *StdioHost) send(msgKind string, msgType string, id string, payload interface{}) {
+	// Note: Standard RPC uses 'id' to distinguish requests from notifications.
+	msg := protocol.RPCMessage{
+		ID:      id,
+		Type:    msgType,
+		Payload: protocol.EncodeRPC(payload),
+	}
+
+	h.SendMessage(msg)
+}

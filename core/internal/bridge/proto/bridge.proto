@@ -1,0 +1,91 @@
+syntax = "proto3";
+
+package bridge;
+
+option go_package = "github.com/igoryan-dao/ricochet/internal/bridge/proto";
+
+service BridgeService {
+  // Handshake establishes the identity and checks for compatibility
+  rpc Handshake(HandshakeRequest) returns (HandshakeResponse);
+}
+
+service ChatService {
+  // SendMessage sends a message to a specific chat
+  rpc SendMessage(OutgoingMessage) returns (MessageResponse);
+  
+  // StreamEvents receives all bridge events (messages, tool calls, etc.)
+  rpc StreamEvents(Empty) returns (stream BridgeEvent);
+}
+
+service STTService {
+  // Transcribe transcribes an audio stream
+  rpc Transcribe(stream AudioChunk) returns (TranscriptionResponse);
+}
+
+message Empty {}
+
+message HandshakeRequest {
+  string session_id = 1;
+  string version = 2;
+  string secret = 3;
+}
+
+message HandshakeResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message MessageResponse {
+  string message_id = 1;
+  bool success = 2;
+}
+
+message AudioChunk {
+  bytes data = 1;
+  string format = 2; // e.g., "webm", "ogg"
+}
+
+message TranscriptionResponse {
+  string text = 1;
+  bool success = 2;
+}
+
+message BridgeEvent {
+  string session_id = 1;
+  oneof payload {
+    IncomingMessage incoming_message = 2;
+    OutgoingMessage outgoing_message = 3;
+    ToolCall tool_call = 4;
+    ToolResult tool_result = 5;
+    Heartbeat heartbeat = 6;
+  }
+}
+
+message IncomingMessage {
+  int64 chat_id = 1;
+  string body = 2;
+  string platform = 3; // "telegram" or "discord"
+}
+
+message OutgoingMessage {
+  int64 chat_id = 1;
+  string body = 2;
+  string platform = 3;
+  string parse_mode = 4;
+}
+
+message ToolCall {
+  string call_id = 1;
+  string tool_name = 2;
+  string arguments_json = 3;
+}
+
+message ToolResult {
+  string call_id = 1;
+  string result_json = 2;
+  bool is_error = 3;
+}
+
+message Heartbeat {
+  int64 timestamp = 1;
+}

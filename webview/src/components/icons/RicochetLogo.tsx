@@ -1,0 +1,27 @@
+import React from 'react';
+
+interface IconProps extends React.SVGProps<SVGSVGElement> {
+    size?: number | string;
+}
+
+export function RicochetLogo({ size = 32, className, ...props }: IconProps) {
+    return (
+        <svg
+            width={size}
+            height={size}
+            viewBox="0 0 32 32"
+            fill="none"
+            xmlns="http://www.w3.org/2000/svg"
+            className={className}
+            {...props}
+        >
+            <path d="M9.75 7H9.25C9.11193 7 9 7.44772 9 8V23C9 23.5523 9.11193 24 9.25 24H9.75C9.88807 24 10 23.5523 10 23V8C10 7.44772 9.88807 7 9.75 7Z" fill="currentColor" />
+            <path d="M23 11.5C23 9.567 21.433 8 19.5 8C17.567 8 16 9.567 16 11.5C16 13.433 17.567 15 19.5 15C21.433 15 23 13.433 23 11.5Z" fill="currentColor" />
+            <path d="M19 14C19 12.3431 17.6569 11 16 11C14.3431 11 13 12.3431 13 14C13 15.6569 14.3431 17 16 17C17.6569 17 19 15.6569 19 14Z" fill="currentColor" fillOpacity="0.7" />
+            <path d="M15 16C15 14.8954 14.1046 14 13 14C11.8954 14 11 14.8954 11 16C11 17.1046 11.8954 18 13 18C14.1046 18 15 17.1046 15 16Z" fill="currentColor" fillOpacity="0.5" />
+            <path d="M15 18.5C15 17.6716 14.3284 17 13.5 17C12.6716 17 12 17.6716 12 18.5C12 19.3284 12.6716 20 13.5 20C14.3284 20 15 19.3284 15 18.5Z" fill="currentColor" fillOpacity="0.3" />
+            <path d="M16 20.5C16 19.6716 15.3284 19 14.5 19C13.6716 19 13 19.6716 13 20.5C13 21.3284 13.6716 22 14.5 22C15.3284 22 16 21.3284 16 20.5Z" fill="currentColor" fillOpacity="0.1" />
+            <path d="M17 22.5C17 21.6716 16.3284 21 15.5 21C14.6716 21 14 22.5 14 22.5C14 23.3284 14.6716 24 15.5 24C16.3284 24 17 23.3284 17 22.5Z" fill="currentColor" fillOpacity="0.1" />
+        </svg>
+    );
+}

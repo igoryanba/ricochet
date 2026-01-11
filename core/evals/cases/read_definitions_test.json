@@ -1,0 +1,15 @@
+{
+    "id": "read_definitions_test",
+    "description": "Verify agent uses read_definitions to understand a Go file",
+    "initial_state": {
+        "files": {
+            "utils.go": "package utils\n\nfunc SecretLogic() string {\n\treturn \"hidden\"\n}\n\ntype Data struct {\n\tValue int\n}\n"
+        }
+    },
+    "prompt": "What functions and structs are in utils.go? Use the appropriate tool to find out without reading the whole file.",
+    "expected": {
+        "tools": [
+            "read_definitions"
+        ]
+    }
+}

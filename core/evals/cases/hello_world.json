@@ -1,0 +1,19 @@
+{
+    "id": "hello_world",
+    "description": "Create a hello.txt file with specific content",
+    "initial_state": {
+        "files": {}
+    },
+    "prompt": "Create a file named 'hello.txt' with the content 'Hello Ricochet!'. Result must be EXACTly as specified.",
+    "expected": {
+        "files": {
+            "hello.txt": {
+                "exists": true,
+                "exact": "Hello Ricochet!"
+            }
+        },
+        "tools": [
+            "write_file"
+        ]
+    }
+}

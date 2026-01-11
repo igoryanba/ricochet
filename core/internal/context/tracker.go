@@ -1,0 +1,88 @@
+package context
+
+import (
+	"fmt"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"sync"
+	"time"
+)
+
+// Tracker defines interface for context providers
+type Tracker interface {
+	GetContext() string
+}
+
+// EnvironmentTracker tracks system environment
+type EnvironmentTracker struct {
+	cwd string
+}
+
+// NewEnvironmentTracker creates a new environment tracker
+func NewEnvironmentTracker(cwd string) *EnvironmentTracker {
+	return &EnvironmentTracker{cwd: cwd}
+}
+
+func (e *EnvironmentTracker) GetContext() string {
+	var sb strings.Builder
+	sb.WriteString("## Environment Context\n")
+	sb.WriteString(fmt.Sprintf("- OS: %s\n", runtime.GOOS))
+	sb.WriteString(fmt.Sprintf("- CWD: %s\n", e.cwd))
+
+	// Project type detection
+	if _, err := os.Stat(filepath.Join(e.cwd, "go.mod")); err == nil {
+		sb.WriteString("- Project Type: Go\n")
+	} else if _, err := os.Stat(filepath.Join(e.cwd, "package.json")); err == nil {
+		sb.WriteString("- Project Type: Node.js/JavaScript\n")
+	} else if _, err := os.Stat(filepath.Join(e.cwd, "Cargo.toml")); err == nil {
+		sb.WriteString("- Project Type: Rust\n")
+	} else if _, err := os.Stat(filepath.Join(e.cwd, "requirements.txt")); err == nil {
+		sb.WriteString("- Project Type: Python\n")
+	}
+
+	sb.WriteString(fmt.Sprintf("- Time: %s\n", time.Now().Format(time.RFC1123)))
+
+	return sb.String()
+}
+
+// FileTracker tracks files relevant to the session
+type FileTracker struct {
+	mu            sync.RWMutex
+	accessedFiles map[string]time.Time
+}
+
+// NewFileTracker creates a new file tracker
+func NewFileTracker() *FileTracker {
+	return &FileTracker{
+		accessedFiles: make(map[string]time.Time),
+	}
+}
+
+// AddFile marks a file as accessed
+func (f *FileTracker) AddFile(path string) {
+	if path == "" {
+		return
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.accessedFiles[path] = time.Now()
+}
+
+// GetContext returns the list of recently accessed files
+func (f *FileTracker) GetContext() string {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+
+	if len(f.accessedFiles) == 0 {
+		return ""
+	}
+
+	var sb strings.Builder
+	sb.WriteString("## Accessed Files\n")
+	for path := range f.accessedFiles {
+		sb.WriteString(fmt.Sprintf("- %s\n", path))
+	}
+	return sb.String()
+}

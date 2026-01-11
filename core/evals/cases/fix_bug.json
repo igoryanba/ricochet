@@ -1,0 +1,18 @@
+{
+    "id": "fix_bug",
+    "description": "Fix a simple syntax error in Go code",
+    "initial_state": {
+        "files": {
+            "main.go": "package main\n\nimport \"fmt\"\n\nfunc main() {\n\tfmt.Println(\"Missing brace\")\n"
+        }
+    },
+    "prompt": "Fix the syntax error in main.go. Just close the function.",
+    "expected": {
+        "files": {
+            "main.go": {
+                "exists": true,
+                "contains": "}"
+            }
+        }
+    }
+}
