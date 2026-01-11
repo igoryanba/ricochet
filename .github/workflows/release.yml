@@ -1,0 +1,127 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-core:
+    name: Build Core (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: linux-x64
+            goos: linux
+            goarch: amd64
+            ext: ""
+          - os: windows-latest
+            target: win32-x64
+            goos: windows
+            goarch: amd64
+            ext: ".exe"
+          - os: macos-latest
+            target: darwin-x64
+            goos: darwin
+            goarch: amd64
+            ext: ""
+          - os: macos-latest
+            target: darwin-arm64
+            goos: darwin
+            goarch: arm64
+            ext: ""
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+
+      - name: Install Dependencies
+        run: |
+          cd core
+          go mod download
+
+      - name: Build Binary
+        shell: bash
+        run: |
+          cd core
+          mkdir -p ../extension-vscode/bin/${{ matrix.target }}
+          GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} CGO_ENABLED=1 go build -ldflags="-s -w" -o ../extension-vscode/bin/${{ matrix.target }}/ricochet-core${{ matrix.ext }} ./cmd/ricochet
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: core-${{ matrix.target }}
+          path: extension-vscode/bin/${{ matrix.target }}
+
+  package-and-release:
+    name: Package Extension & Release
+    needs: build-core
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install Webview Dependencies
+        run: |
+          cd webview
+          npm ci
+
+      - name: Build Webview
+        run: |
+          cd webview
+          npm run build
+
+      - name: Install Extension Dependencies
+        run: |
+          cd extension-vscode
+          npm ci
+
+      - name: Download Core Binaries
+        uses: actions/download-artifact@v4
+        with:
+          path: extension-vscode/bin
+
+      - name: Organize Binaries
+        run: |
+          cd extension-vscode/bin
+          # Move artifacts from subfolders to proper structure if needed
+          # download-artifact puts them in folders named by 'name'
+          # e.g. extension-vscode/bin/core-linux-x64/ricochet-core
+          # We need extension-vscode/bin/linux-x64/ricochet-core
+          
+          mkdir -p linux-x64 win32-x64 darwin-x64 darwin-arm64
+          
+          mv core-linux-x64/* linux-x64/ || true
+          mv core-win32-x64/* win32-x64/ || true
+          mv core-darwin-x64/* darwin-x64/ || true
+          mv core-darwin-arm64/* darwin-arm64/ || true
+          
+          rm -rf core-*
+          chmod +x */ricochet-core*
+
+      - name: Package VSIX
+        run: |
+          cd extension-vscode
+          npm run build
+          npx vsce package --no-dependencies
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: extension-vscode/*.vsix
+          generate_release_notes: true
