@@ -122,7 +122,7 @@ jobs:
           cp GOVERNANCE.md extension-vscode/ || true
           
           # Ensure assets exist
-          ls -F extension-vscode/assets/icon.png
+          ls -F extension-vscode/assets/ricochet.png
 
       - name: Package VSIX
         run: |
