@@ -124,6 +124,13 @@ jobs:
           # Ensure assets exist
           ls -F extension-vscode/assets/ricochet.png
 
+      - name: Set Version from Tag
+        run: |
+          VERSION=${GITHUB_REF_NAME#v}
+          echo "Setting version to $VERSION"
+          cd extension-vscode
+          npm version $VERSION --no-git-tag-version
+
       - name: Package VSIX
         run: |
           cd extension-vscode
