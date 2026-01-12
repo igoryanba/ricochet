@@ -97,6 +97,16 @@ func (e *NativeExecutor) WriteFile(ctx context.Context, args json.RawMessage) (s
 		return "", fmt.Errorf("write file: %w", err)
 	}
 
+	// PHASE 11: Shadow Workspace (Linter Loop)
+	// Verify the written file immediately
+	if e.shadowVerifier != nil {
+		if err := e.shadowVerifier.Verify(ctx, payload.Path); err != nil {
+			// We return an error to force the agent to fix it.
+			// But we clarify that the file WAS written.
+			return "", fmt.Errorf("file written, but failed verification: %w. Please fix the code", err)
+		}
+	}
+
 	return "File written successfully", nil
 }
 

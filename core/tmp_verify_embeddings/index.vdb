@@ -1,0 +1,1 @@
+[{"id":"test.go:3-5","file_path":"test.go","content":"// File: test.go\n// function: main\nfunc main() {\n  // Hello world, this is a test file for vector search.\n}","line_start":3,"line_end":5,"embedding":[0.1,0.2,0.3],"metadata":{"imports":null,"name":"main","pagerank":0.15000000000000002,"type":"function"}}]

@@ -7,8 +7,9 @@ import (
 	"strings"
 
 	sitter "github.com/smacker/go-tree-sitter"
+	"github.com/smacker/go-tree-sitter/golang"
 	"github.com/smacker/go-tree-sitter/javascript"
-	// Uncomment when grammars are available:
+	// Uncomment when grammars are available/needed:
 	// "github.com/smacker/go-tree-sitter/python"
 	// "github.com/smacker/go-tree-sitter/typescript/typescript"
 	// "github.com/smacker/go-tree-sitter/rust"
@@ -21,6 +22,12 @@ type Definition struct {
 	Signature string
 	LineStart int
 	LineEnd   int
+}
+
+// FileAnalysis contains definitions and imports found in a file
+type FileAnalysis struct {
+	Definitions []Definition
+	Imports     []string
 }
 
 // LanguageParser wraps Tree-sitter for multi-language AST parsing
@@ -48,6 +55,8 @@ func (lp *LanguageParser) GetLanguageForFile(path string) (*sitter.Language, err
 	switch ext {
 	case ".js", ".jsx", ".mjs":
 		return javascript.GetLanguage(), nil
+	case ".go":
+		return golang.GetLanguage(), nil
 	// Uncomment when grammars are installed:
 	// case ".ts", ".tsx":
 	// 	return typescript.GetLanguage(), nil
@@ -60,8 +69,8 @@ func (lp *LanguageParser) GetLanguageForFile(path string) (*sitter.Language, err
 	}
 }
 
-// ParseDefinitions extracts code definitions from source code
-func (lp *LanguageParser) ParseDefinitions(ctx context.Context, path string, source []byte) ([]Definition, error) {
+// ParseDefinitions extracts code definitions and imports from source code
+func (lp *LanguageParser) ParseDefinitions(ctx context.Context, path string, source []byte) (*FileAnalysis, error) {
 	lang, err := lp.GetLanguageForFile(path)
 	if err != nil {
 		return nil, err
@@ -82,21 +91,22 @@ func (lp *LanguageParser) ParseDefinitions(ctx context.Context, path string, sou
 	ext := strings.ToLower(filepath.Ext(path))
 	switch ext {
 	case ".js", ".jsx", ".mjs":
-		return lp.extractJavaScriptDefinitions(root, source), nil
-	case ".ts", ".tsx":
-		return lp.extractTypeScriptDefinitions(root, source), nil
-	case ".py":
-		return lp.extractPythonDefinitions(root, source), nil
-	case ".rs":
-		return lp.extractRustDefinitions(root, source), nil
+		return lp.extractJavaScript(root, source), nil
+	case ".go":
+		return lp.extractGo(root, source), nil
+	// case ".ts", ".tsx":
+	// 	return lp.extractTypeScript(root, source), nil
+	// case ".py":
+	// 	return lp.extractPython(root, source), nil
+	// case ".rs":
+	// 	return lp.extractRust(root, source), nil
 	default:
 		return nil, fmt.Errorf("no extractor for %s", ext)
 	}
 }
 
-// extractJavaScriptDefinitions walks the JS AST and extracts definitions
-func (lp *LanguageParser) extractJavaScriptDefinitions(root *sitter.Node, source []byte) []Definition {
-	var defs []Definition
+func (lp *LanguageParser) extractJavaScript(root *sitter.Node, source []byte) *FileAnalysis {
+	var analysis FileAnalysis
 
 	var walk func(node *sitter.Node)
 	walk = func(node *sitter.Node) {
@@ -107,12 +117,37 @@ func (lp *LanguageParser) extractJavaScriptDefinitions(root *sitter.Node, source
 		nodeType := node.Type()
 
 		switch nodeType {
+		case "import_statement":
+			// import X from 'source'
+			if sourceNode := node.ChildByFieldName("source"); sourceNode != nil {
+				// remove quotes
+				path := strings.Trim(sourceNode.Content(source), "\"'`")
+				analysis.Imports = append(analysis.Imports, path)
+			}
+
+		case "call_expression":
+			// require('source')
+			if funcNode := node.ChildByFieldName("function"); funcNode != nil {
+				if funcNode.Content(source) == "require" {
+					if args := node.ChildByFieldName("arguments"); args != nil {
+						if args.NamedChildCount() > 0 {
+							arg := args.NamedChild(0)
+							// simplistic: only string literals
+							if arg.Type() == "string" {
+								path := strings.Trim(arg.Content(source), "\"'`")
+								analysis.Imports = append(analysis.Imports, path)
+							}
+						}
+					}
+				}
+			}
+
 		case "function_declaration":
 			name := ""
 			if nameNode := node.ChildByFieldName("name"); nameNode != nil {
 				name = nameNode.Content(source)
 			}
-			defs = append(defs, Definition{
+			analysis.Definitions = append(analysis.Definitions, Definition{
 				Type:      "function",
 				Name:      name,
 				LineStart: int(node.StartPoint().Row) + 1,
@@ -124,7 +159,7 @@ func (lp *LanguageParser) extractJavaScriptDefinitions(root *sitter.Node, source
 			if nameNode := node.ChildByFieldName("name"); nameNode != nil {
 				name = nameNode.Content(source)
 			}
-			defs = append(defs, Definition{
+			analysis.Definitions = append(analysis.Definitions, Definition{
 				Type:      "class",
 				Name:      name,
 				LineStart: int(node.StartPoint().Row) + 1,
@@ -136,69 +171,72 @@ func (lp *LanguageParser) extractJavaScriptDefinitions(root *sitter.Node, source
 			if nameNode := node.ChildByFieldName("name"); nameNode != nil {
 				name = nameNode.Content(source)
 			}
-			defs = append(defs, Definition{
+			analysis.Definitions = append(analysis.Definitions, Definition{
 				Type:      "method",
 				Name:      name,
 				LineStart: int(node.StartPoint().Row) + 1,
 				LineEnd:   int(node.EndPoint().Row) + 1,
 			})
-
-		case "arrow_function":
-			// Arrow functions assigned to variables
-			parent := node.Parent()
-			if parent != nil && parent.Type() == "variable_declarator" {
-				if nameNode := parent.ChildByFieldName("name"); nameNode != nil {
-					defs = append(defs, Definition{
-						Type:      "function",
-						Name:      nameNode.Content(source),
-						LineStart: int(node.StartPoint().Row) + 1,
-						LineEnd:   int(node.EndPoint().Row) + 1,
-					})
-				}
-			}
 		}
 
-		// Recurse into children
 		for i := 0; i < int(node.ChildCount()); i++ {
 			walk(node.Child(i))
 		}
 	}
 
 	walk(root)
-	return defs
+	return &analysis
 }
 
-// extractTypeScriptDefinitions - similar to JS with interface/type support
-func (lp *LanguageParser) extractTypeScriptDefinitions(root *sitter.Node, source []byte) []Definition {
-	// TypeScript shares most patterns with JavaScript
-	defs := lp.extractJavaScriptDefinitions(root, source)
+func (lp *LanguageParser) extractGo(root *sitter.Node, source []byte) *FileAnalysis {
+	var analysis FileAnalysis
 
-	// Add TypeScript-specific types
-	var walkTS func(node *sitter.Node)
-	walkTS = func(node *sitter.Node) {
+	var walk func(node *sitter.Node)
+	walk = func(node *sitter.Node) {
 		if node == nil {
 			return
 		}
 
-		switch node.Type() {
-		case "interface_declaration":
+		nodeType := node.Type()
+
+		switch nodeType {
+		case "import_spec":
+			if pathNode := node.ChildByFieldName("path"); pathNode != nil {
+				path := strings.Trim(pathNode.Content(source), "\"")
+				analysis.Imports = append(analysis.Imports, path)
+			}
+
+		case "function_declaration":
 			name := ""
 			if nameNode := node.ChildByFieldName("name"); nameNode != nil {
 				name = nameNode.Content(source)
 			}
-			defs = append(defs, Definition{
-				Type:      "interface",
+			analysis.Definitions = append(analysis.Definitions, Definition{
+				Type:      "function",
 				Name:      name,
 				LineStart: int(node.StartPoint().Row) + 1,
 				LineEnd:   int(node.EndPoint().Row) + 1,
 			})
 
-		case "type_alias_declaration":
+		case "method_declaration":
 			name := ""
 			if nameNode := node.ChildByFieldName("name"); nameNode != nil {
 				name = nameNode.Content(source)
 			}
-			defs = append(defs, Definition{
+			// receiver logic could be added here
+			analysis.Definitions = append(analysis.Definitions, Definition{
+				Type:      "method",
+				Name:      name,
+				LineStart: int(node.StartPoint().Row) + 1,
+				LineEnd:   int(node.EndPoint().Row) + 1,
+			})
+
+		case "type_spec":
+			name := ""
+			if nameNode := node.ChildByFieldName("name"); nameNode != nil {
+				name = nameNode.Content(source)
+			}
+			analysis.Definitions = append(analysis.Definitions, Definition{
 				Type:      "type",
 				Name:      name,
 				LineStart: int(node.StartPoint().Row) + 1,
@@ -207,120 +245,10 @@ func (lp *LanguageParser) extractTypeScriptDefinitions(root *sitter.Node, source
 		}
 
 		for i := 0; i < int(node.ChildCount()); i++ {
-			walkTS(node.Child(i))
-		}
-	}
-
-	walkTS(root)
-	return defs
-}
-
-// extractPythonDefinitions walks Python AST
-func (lp *LanguageParser) extractPythonDefinitions(root *sitter.Node, source []byte) []Definition {
-	var defs []Definition
-
-	var walk func(node *sitter.Node)
-	walk = func(node *sitter.Node) {
-		if node == nil {
-			return
-		}
-
-		switch node.Type() {
-		case "function_definition":
-			name := ""
-			if nameNode := node.ChildByFieldName("name"); nameNode != nil {
-				name = nameNode.Content(source)
-			}
-			defs = append(defs, Definition{
-				Type:      "function",
-				Name:      name,
-				LineStart: int(node.StartPoint().Row) + 1,
-				LineEnd:   int(node.EndPoint().Row) + 1,
-			})
-
-		case "class_definition":
-			name := ""
-			if nameNode := node.ChildByFieldName("name"); nameNode != nil {
-				name = nameNode.Content(source)
-			}
-			defs = append(defs, Definition{
-				Type:      "class",
-				Name:      name,
-				LineStart: int(node.StartPoint().Row) + 1,
-				LineEnd:   int(node.EndPoint().Row) + 1,
-			})
-		}
-
-		for i := 0; i < int(node.ChildCount()); i++ {
 			walk(node.Child(i))
 		}
 	}
 
 	walk(root)
-	return defs
-}
-
-// extractRustDefinitions walks Rust AST
-func (lp *LanguageParser) extractRustDefinitions(root *sitter.Node, source []byte) []Definition {
-	var defs []Definition
-
-	var walk func(node *sitter.Node)
-	walk = func(node *sitter.Node) {
-		if node == nil {
-			return
-		}
-
-		switch node.Type() {
-		case "function_item":
-			name := ""
-			if nameNode := node.ChildByFieldName("name"); nameNode != nil {
-				name = nameNode.Content(source)
-			}
-			defs = append(defs, Definition{
-				Type:      "function",
-				Name:      name,
-				LineStart: int(node.StartPoint().Row) + 1,
-				LineEnd:   int(node.EndPoint().Row) + 1,
-			})
-
-		case "struct_item":
-			name := ""
-			if nameNode := node.ChildByFieldName("name"); nameNode != nil {
-				name = nameNode.Content(source)
-			}
-			defs = append(defs, Definition{
-				Type:      "struct",
-				Name:      name,
-				LineStart: int(node.StartPoint().Row) + 1,
-				LineEnd:   int(node.EndPoint().Row) + 1,
-			})
-
-		case "impl_item":
-			defs = append(defs, Definition{
-				Type:      "impl",
-				Name:      "impl",
-				LineStart: int(node.StartPoint().Row) + 1,
-				LineEnd:   int(node.EndPoint().Row) + 1,
-			})
-
-		case "trait_item":
-			name := ""
-			if nameNode := node.ChildByFieldName("name"); nameNode != nil {
-				name = nameNode.Content(source)
-			}
-			defs = append(defs, Definition{
-				Type:      "trait",
-				Name:      name,
-				LineStart: int(node.StartPoint().Row) + 1,
-				LineEnd:   int(node.EndPoint().Row) + 1,
-			})
-		}
-
-		for i := 0; i < int(node.ChildCount()); i++ {
-			walk(node.Child(i))
-		}
-	}
-
-	walk(root)
-	return defs
+	return &analysis
 }

@@ -22,6 +22,7 @@ type ContextResult struct {
 	WasCondensed bool
 	WasTruncated bool
 	Summary      string
+	SystemPrompt string // Modified system prompt (e.g. with Condensed Context)
 	TokensUsed   int
 	TokensMax    int
 	Percentage   float64
@@ -70,8 +71,9 @@ type toolCallKey struct {
 // It tries condensation first, then falls back to sliding window pruning
 func (wm *WindowManager) ManageContext(ctx context.Context, messages []protocol.Message, systemPrompt string) (*ContextResult, error) {
 	result := &ContextResult{
-		Messages:  messages,
-		TokensMax: wm.MaxTokens,
+		Messages:     messages,
+		SystemPrompt: systemPrompt,
+		TokensMax:    wm.MaxTokens,
 	}
 
 	// Calculate system tokens separately

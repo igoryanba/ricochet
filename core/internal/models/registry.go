@@ -77,6 +77,24 @@ var Registry = map[string]ProviderInfo{
 			{ID: "MiniMax-Text-02", Name: "MiniMax Text 02", Provider: "minimax", ContextWindow: 1000000, InputPrice: 1.0, OutputPrice: 4.0, IsFree: false, SupportsTools: true, Description: "1M context"},
 		},
 	},
+	"moonshot": {
+		ID:   "moonshot",
+		Name: "Moonshot AI (Kimi)",
+		Models: []ModelInfo{
+			{ID: "moonshot-v1-8k", Name: "Kimi 8k", Provider: "moonshot", ContextWindow: 8000, InputPrice: 0.15, OutputPrice: 0.60, IsFree: false, SupportsTools: true, Description: "Standard context"},
+			{ID: "moonshot-v1-32k", Name: "Kimi 32k", Provider: "moonshot", ContextWindow: 32000, InputPrice: 0.30, OutputPrice: 1.20, IsFree: false, SupportsTools: true, Description: "Long context"},
+			{ID: "moonshot-v1-128k", Name: "Kimi 128k", Provider: "moonshot", ContextWindow: 128000, InputPrice: 0.60, OutputPrice: 2.40, IsFree: false, SupportsTools: true, Description: "Ultra long context"},
+		},
+	},
+	"zhipu": {
+		ID:   "zhipu",
+		Name: "Zhipu AI (GLM)",
+		Models: []ModelInfo{
+			{ID: "glm-4-plus", Name: "GLM-4 Plus", Provider: "zhipu", ContextWindow: 128000, InputPrice: 5.0, OutputPrice: 10.0, IsFree: false, SupportsTools: true, Description: "Latest flagship"},
+			{ID: "glm-4-flash", Name: "GLM-4 Flash", Provider: "zhipu", ContextWindow: 128000, InputPrice: 0.01, OutputPrice: 0.01, IsFree: true, SupportsTools: true, Description: "Extremely fast & cheap"},
+			{ID: "glm-4-air", Name: "GLM-4 Air", Provider: "zhipu", ContextWindow: 128000, InputPrice: 0.10, OutputPrice: 0.10, IsFree: false, SupportsTools: true, Description: "Balanced performance"},
+		},
+	},
 	"openrouter": {
 		ID:   "openrouter",
 		Name: "OpenRouter",

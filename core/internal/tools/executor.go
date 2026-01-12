@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/igoryan-dao/ricochet/internal/browser"
+	"github.com/igoryan-dao/ricochet/internal/codegraph"
 	contextPkg "github.com/igoryan-dao/ricochet/internal/context"
 	"github.com/igoryan-dao/ricochet/internal/context/parser"
 	"github.com/igoryan-dao/ricochet/internal/host"
@@ -39,23 +40,27 @@ type LiveModeProvider interface {
 
 // NativeExecutor implements Executor using a Host for OS operations and ModeManager for permissions
 type NativeExecutor struct {
-	host      host.Host
-	modes     *modes.Manager
-	safeguard *safeguard.Manager
-	browser   *browser.BrowserManager
-	mcpHub    *mcpHubPkg.Hub
-	indexer   *index.Indexer
-	livemode  LiveModeProvider
+	host           host.Host
+	modes          *modes.Manager
+	safeguard      *safeguard.Manager
+	browser        *browser.BrowserManager
+	mcpHub         *mcpHubPkg.Hub
+	indexer        *index.Indexer
+	codegraph      *codegraph.Service
+	livemode       LiveModeProvider
+	shadowVerifier *safeguard.ShadowVerifier
 }
 
-func NewNativeExecutor(h host.Host, m *modes.Manager, sg *safeguard.Manager, mcpHub *mcpHubPkg.Hub, idx *index.Indexer) *NativeExecutor {
+func NewNativeExecutor(h host.Host, m *modes.Manager, sg *safeguard.Manager, mcpHub *mcpHubPkg.Hub, idx *index.Indexer, cg *codegraph.Service) *NativeExecutor {
 	return &NativeExecutor{
-		host:      h,
-		modes:     m,
-		safeguard: sg,
-		browser:   browser.NewBrowserManager(os.Getenv("RICOCHET_BROWSER_URL")),
-		mcpHub:    mcpHub,
-		indexer:   idx,
+		host:           h,
+		modes:          m,
+		safeguard:      sg,
+		browser:        browser.NewBrowserManager(os.Getenv("RICOCHET_BROWSER_URL")),
+		mcpHub:         mcpHub,
+		indexer:        idx,
+		codegraph:      cg,
+		shadowVerifier: safeguard.NewShadowVerifier(),
 	}
 }
 
@@ -65,6 +70,13 @@ func (e *NativeExecutor) SetLiveMode(lm LiveModeProvider) {
 }
 
 func (e *NativeExecutor) Execute(ctx context.Context, name string, args json.RawMessage) (string, error) {
+	// 1. Enforce Trust Zones
+	if e.safeguard != nil {
+		if err := e.safeguard.CheckPermission(name); err != nil {
+			return "", fmt.Errorf("safeguard violation: %w", err)
+		}
+	}
+
 	switch name {
 	case "list_dir":
 		return e.ListDir(args)
@@ -94,6 +106,8 @@ func (e *NativeExecutor) Execute(ctx context.Context, name string, args json.Raw
 		return e.SwitchMode(args)
 	case "update_todos":
 		return "Interpreted by controller", nil
+	case "execute_python":
+		return e.ExecutePythonTool(ctx, args)
 	default:
 		// Check MCP tools
 		if e.mcpHub != nil {
@@ -229,6 +243,10 @@ func (e *NativeExecutor) GetDefinitions() []ToolDefinition {
 						"type":        "string",
 						"description": "Mode slug to switch to (e.g., 'architect', 'code', 'test')",
 					},
+					"handoff": map[string]interface{}{
+						"type":        "boolean",
+						"description": "If true, triggers 'Intelligent Handoff' (summarizes context to SPEC.md before switching).",
+					},
 				},
 				"required": []string{"mode"},
 			},
@@ -270,6 +288,20 @@ func (e *NativeExecutor) GetDefinitions() []ToolDefinition {
 					},
 				},
 				"required": []string{"query"},
+			},
+		},
+		{
+			Name:        "execute_python",
+			Description: "Execute a Python script. Use this to analyze files, perform math, or automate tasks instead of making multiple tool calls. Stdout/stderr are captured.",
+			InputSchema: map[string]interface{}{
+				"type": "object",
+				"properties": map[string]interface{}{
+					"script": map[string]interface{}{
+						"type":        "string",
+						"description": "The valid Python script to execute.",
+					},
+				},
+				"required": []string{"script"},
 			},
 		},
 	}
@@ -373,6 +405,16 @@ func (e *NativeExecutor) GetDefinitions() []ToolDefinition {
 	return defs
 }
 
+func (e *NativeExecutor) ExecutePythonTool(ctx context.Context, args json.RawMessage) (string, error) {
+	var payload struct {
+		Script string `json:"script"`
+	}
+	if err := json.Unmarshal(args, &payload); err != nil {
+		return "", fmt.Errorf("invalid arguments: %w", err)
+	}
+	return ExecutePython(ctx, payload.Script)
+}
+
 func (e *NativeExecutor) SwitchMode(args json.RawMessage) (string, error) {
 	var payload struct {
 		Mode string `json:"mode"`
@@ -452,6 +494,7 @@ func (e *NativeExecutor) ReadDefinitions(args json.RawMessage) (string, error) {
 		".ts": true, ".tsx": true,
 		".py": true,
 		".rs": true,
+		".go": true,
 	}
 
 	if !supportedExts[ext] {
@@ -462,16 +505,16 @@ func (e *NativeExecutor) ReadDefinitions(args json.RawMessage) (string, error) {
 	langParser := contextPkg.NewLanguageParser()
 	defer langParser.Close()
 
-	defs, err := langParser.ParseDefinitions(ctx, targetPath, content)
+	analysis, err := langParser.ParseDefinitions(ctx, targetPath, content)
 	if err != nil {
 		return "", fmt.Errorf("tree-sitter parse error: %w", err)
 	}
 
-	if len(defs) == 0 {
+	if len(analysis.Definitions) == 0 {
 		return "No definitions found.", nil
 	}
 
-	for _, d := range defs {
+	for _, d := range analysis.Definitions {
 		sb.WriteString(fmt.Sprintf("- [%s] %s (Lines %d-%d)\n", d.Type, d.Name, d.LineStart, d.LineEnd))
 	}
 

@@ -44,6 +44,7 @@ type anthropicRequest struct {
 	Messages  []anthropicMessage `json:"messages"`
 	System    string             `json:"system,omitempty"`
 	Tools     []anthropicTool    `json:"tools,omitempty"`
+	Thinking  *anthropicThinking `json:"thinking,omitempty"`
 	Stream    bool               `json:"stream,omitempty"`
 }
 
@@ -53,20 +54,31 @@ type anthropicMessage struct {
 }
 
 type anthropicContentBlock struct {
-	Type      string          `json:"type"` // text, tool_use, tool_result
-	Text      string          `json:"text,omitempty"`
-	ID        string          `json:"id,omitempty"`
-	Name      string          `json:"name,omitempty"`
-	Input     json.RawMessage `json:"input,omitempty"`
-	ToolUseID string          `json:"tool_use_id,omitempty"`
-	Content   string          `json:"content,omitempty"`
-	IsError   bool            `json:"is_error,omitempty"`
+	Type         string                 `json:"type"` // text, tool_use, tool_result
+	Text         string                 `json:"text,omitempty"`
+	ID           string                 `json:"id,omitempty"`
+	Name         string                 `json:"name,omitempty"`
+	Input        json.RawMessage        `json:"input,omitempty"`
+	ToolUseID    string                 `json:"tool_use_id,omitempty"`
+	Content      string                 `json:"content,omitempty"`
+	IsError      bool                   `json:"is_error,omitempty"`
+	CacheControl *anthropicCacheControl `json:"cache_control,omitempty"`
 }
 
 type anthropicTool struct {
-	Name        string                 `json:"name"`
-	Description string                 `json:"description"`
-	InputSchema map[string]interface{} `json:"input_schema"`
+	Name         string                 `json:"name"`
+	Description  string                 `json:"description"`
+	InputSchema  map[string]interface{} `json:"input_schema"`
+	CacheControl *anthropicCacheControl `json:"cache_control,omitempty"`
+}
+
+type anthropicCacheControl struct {
+	Type string `json:"type"`
+}
+
+type anthropicThinking struct {
+	Type         string `json:"type"`
+	BudgetTokens int    `json:"budget_tokens"`
 }
 
 // anthropicResponse is the Anthropic API response format
@@ -225,6 +237,18 @@ func (p *AnthropicProvider) buildRequest(req *ChatRequest, stream bool) *anthrop
 			InputSchema: t.InputSchema,
 		})
 	}
+	// Cache the last tool to cache the system prompt and tools definitions
+	if len(tools) > 0 {
+		tools[len(tools)-1].CacheControl = &anthropicCacheControl{Type: "ephemeral"}
+	}
+
+	var thinking *anthropicThinking
+	if strings.Contains(p.model, "claude-3-7") && maxTokens >= 4000 {
+		thinking = &anthropicThinking{
+			Type:         "enabled",
+			BudgetTokens: 2048, // Default budget for reasoning
+		}
+	}
 
 	return &anthropicRequest{
 		Model:     p.model,
@@ -232,6 +256,7 @@ func (p *AnthropicProvider) buildRequest(req *ChatRequest, stream bool) *anthrop
 		Messages:  messages,
 		System:    req.SystemPrompt,
 		Tools:     tools,
+		Thinking:  thinking,
 		Stream:    stream,
 	}
 }

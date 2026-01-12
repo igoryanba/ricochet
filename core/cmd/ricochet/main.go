@@ -6,14 +6,16 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"sync"
 	"syscall"
+	"time"
 
+	"github.com/gorilla/websocket"
 	"github.com/igoryan-dao/ricochet/internal/agent"
-	"github.com/igoryan-dao/ricochet/internal/checkpoints"
+	"github.com/igoryan-dao/ricochet/internal/codegraph"
 	"github.com/igoryan-dao/ricochet/internal/config"
 	"github.com/igoryan-dao/ricochet/internal/host"
 	"github.com/igoryan-dao/ricochet/internal/livemode"
@@ -21,33 +23,106 @@ import (
 	"github.com/igoryan-dao/ricochet/internal/modes"
 	"github.com/igoryan-dao/ricochet/internal/prompts"
 	"github.com/igoryan-dao/ricochet/internal/protocol"
-	"github.com/igoryan-dao/ricochet/internal/whisper"
+	"github.com/igoryan-dao/ricochet/internal/server"
 )
 
 var (
-	agentController    *agent.Controller
-	liveModeController *livemode.Controller
-	checkpointService  *checkpoints.CheckpointService
-	providersManager   *config.ProvidersManager
-	outputMu           sync.Mutex
-	cfg                *agent.Config
-	liveModeConfig     *livemode.Config
-	settingsStore      *config.Store
-	globalCtx          context.Context
-	audioBuffer        []byte
-	audioMu            sync.Mutex
-	transcriber        *whisper.Transcriber
-	stdioHost          *host.StdioHost
-	modesManager       *modes.Manager
-	mcpHub             *mcp.Hub
-	initMu             sync.Mutex
+	// State is now managed by server.Handler, but we keep initial config here
+	// to pass to the handler constructor.
+	cfg            *agent.Config
+	liveModeConfig *livemode.Config
+	settingsStore  *config.Store
+	outputMu       sync.Mutex
+
+	// Server Hub
+	wsHub *WsHub
 )
 
-type Response struct {
-	ID      interface{} `json:"id,omitempty"`
-	Type    string      `json:"type,omitempty"`
-	Payload interface{} `json:"payload,omitempty"`
-	Error   string      `json:"error,omitempty"`
+// StdioWriter implements server.ResponseWriter for Stdio
+type StdioWriter struct{}
+
+func (w *StdioWriter) Send(msg interface{}) error {
+	sendMessage(msg)
+	return nil
+}
+
+// WsWriter implements server.ResponseWriter for WebSocket (broadcasts to specific conn or all)
+type WsWriter struct {
+	conn *websocket.Conn
+	mu   sync.Mutex
+}
+
+func (w *WsWriter) Send(msg interface{}) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.conn.WriteJSON(msg)
+}
+
+// BroadcastWriter implements server.ResponseWriter for broadcasting to all clients
+type BroadcastWriter struct {
+	hub *WsHub
+}
+
+func (w *BroadcastWriter) Send(msg interface{}) error {
+	w.hub.Broadcast(msg)
+	return nil
+}
+
+type WsHub struct {
+	clients    map[*websocket.Conn]bool
+	clientsMu  sync.RWMutex
+	register   chan *websocket.Conn
+	unregister chan *websocket.Conn
+}
+
+func NewWsHub() *WsHub {
+	return &WsHub{
+		clients:    make(map[*websocket.Conn]bool),
+		register:   make(chan *websocket.Conn),
+		unregister: make(chan *websocket.Conn),
+	}
+}
+
+func (h *WsHub) Run(ctx context.Context) {
+	for {
+		select {
+		case client := <-h.register:
+			h.clientsMu.Lock()
+			h.clients[client] = true
+			h.clientsMu.Unlock()
+			log.Printf("Client connected. Total: %d", len(h.clients))
+		case client := <-h.unregister:
+			h.clientsMu.Lock()
+			if _, ok := h.clients[client]; ok {
+				delete(h.clients, client)
+				client.Close()
+			}
+			h.clientsMu.Unlock()
+			log.Printf("Client disconnected. Total: %d", len(h.clients))
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+func (h *WsHub) Broadcast(msg interface{}) {
+	h.clientsMu.RLock()
+	defer h.clientsMu.RUnlock()
+
+	for client := range h.clients {
+		err := client.WriteJSON(msg)
+		if err != nil {
+			log.Printf("Error broadcasting to client: %v", err)
+			// Don't unregister here to avoid deadlock, let the reader loop handle disconnect
+		}
+	}
+}
+
+var upgrader = websocket.Upgrader{
+	ReadBufferSize:  1024,
+	WriteBufferSize: 1024,
+	// Allow all origins for local dev
+	CheckOrigin: func(r *http.Request) bool { return true },
 }
 
 func main() {
@@ -90,41 +165,89 @@ func main() {
 			APIKey:   settings.Provider.APIKey,
 		},
 		SystemPrompt:    prompts.BuildSystemPrompt(cwd),
-		MaxTokens:       4096,   // Max tokens for response
-		ContextWindow:   128000, // Context window for DeepSeek (will be updated when model changes)
+		MaxTokens:       4096, // Max tokens for response
+		ContextWindow:   128000,
 		EnableCodeIndex: settings.Context.EnableCodeIndex,
+	}
+
+	// Configure Embedding Provider if one is specified
+	if settings.Provider.EmbeddingProvider != "" {
+		embKey := settings.Provider.APIKeys[settings.Provider.EmbeddingProvider]
+		if embKey == "" && settings.Provider.Provider == settings.Provider.EmbeddingProvider {
+			embKey = settings.Provider.APIKey
+		}
+
+		cfg.EmbeddingProvider = &agent.ProviderConfig{
+			Provider: settings.Provider.EmbeddingProvider,
+			Model:    settings.Provider.EmbeddingModel,
+			APIKey:   embKey,
+		}
 	}
 
 	// Initialize Live Mode config (will be updated via settings)
 	liveModeConfig = &livemode.Config{
 		TelegramToken:  settings.LiveMode.TelegramToken,
 		TelegramChatID: settings.LiveMode.TelegramChatID,
-		AllowedUserIDs: []int64{}, // Empty = allow all (bot is protected by token)
+		AllowedUserIDs: []int64{},
 	}
-	globalCtx = ctx
 
-	// Check for --stdio mode
-	if len(os.Args) > 1 && os.Args[1] == "--stdio" {
-		runStdioMode(ctx)
+	// Check for flags
+	args := os.Args[1:]
+	isServer := false
+	port := "5555"
+	isStdio := false
+
+	for i := 0; i < len(args); i++ {
+		if args[i] == "--server" {
+			isServer = true
+		} else if args[i] == "--port" && i+1 < len(args) {
+			port = args[i+1]
+			i++
+		} else if args[i] == "--stdio" {
+			isStdio = true
+		}
+	}
+
+	if isServer {
+		runServerMode(ctx, cwd, port)
+	} else if isStdio {
+		runStdioMode(ctx, cwd)
 	} else {
+		// Default to MCP mode if no args, or handle as needed
 		runMCPMode(ctx)
 	}
 }
 
 // runStdioMode runs as sidecar process communicating with extension via stdio
-func runStdioMode(ctx context.Context) {
+func runStdioMode(ctx context.Context, cwd string) {
 	log.Println("Starting in stdio mode...")
 
-	cwd, _ := os.Getwd()
-	stdioHost = host.NewStdioHost(cwd)
-	modesManager = modes.NewManager(cwd)
-	mcpHub = mcp.NewHub(cwd)
+	stdioHost := host.NewStdioHost(cwd)
+	modesManager := modes.NewManager(cwd)
+	mcpHub := mcp.NewHub(cwd)
+	cg := codegraph.NewService()
+
 	modesManager.SetOnModeChange(func(slug string) {
 		sendMessage(protocol.RPCMessage{
 			Type:    "mode_changed",
 			Payload: protocol.EncodeRPC(map[string]string{"mode": slug}),
 		})
 	})
+
+	// Initialize Handler
+	// We pass nil for ProvidersManager initially, Handler handles lazy load if needed
+	handler := server.NewHandler(
+		ctx,
+		cfg,
+		liveModeConfig,
+		settingsStore,
+		stdioHost,
+		modesManager,
+		mcpHub,
+		cg,
+		nil,
+	)
+	writer := &StdioWriter{}
 
 	// Send ready message
 	sendMessage(protocol.RPCMessage{Type: "ready", Payload: protocol.EncodeRPC(map[string]string{"version": "0.1.0"})})
@@ -148,27 +271,7 @@ func runStdioMode(ctx context.Context) {
 			continue
 		}
 
-		// Ensure controller is initialized with StdioHost if not already
-		if agentController == nil {
-			initMu.Lock()
-			if agentController == nil {
-				var err error
-				agentController, err = agent.NewController(cfg, agent.ControllerOptions{
-					Host:             stdioHost,
-					Modes:            modesManager,
-					McpHub:           mcpHub,
-					ProvidersManager: providersManager,
-				})
-				if err != nil {
-					log.Printf("Failed to initialize controller: %v", err)
-				} else if liveModeController != nil {
-					agentController.SetLiveMode(liveModeController)
-				}
-			}
-			initMu.Unlock()
-		}
-
-		// Handle response type directly in loop
+		// Handle response type directly in loop (Host specific)
 		if msg.Type == "response" {
 			var payload string
 			// For RawMessage, we just pass the raw bytes or unmarshal if needed
@@ -188,7 +291,8 @@ func runStdioMode(ctx context.Context) {
 			continue
 		}
 
-		go handleMessage(ctx, msg)
+		// Process message via Handler
+		go handler.HandleMessage(msg, writer)
 	}
 
 	if err := scanner.Err(); err != nil {
@@ -196,803 +300,111 @@ func runStdioMode(ctx context.Context) {
 	}
 }
 
+// runServerMode runs as a WebSocket server (Dawn of the Daemon)
+func runServerMode(ctx context.Context, cwd, port string) {
+	log.Printf("Starting in Server Mode on port %s...", port)
+
+	// Server Host acts conceptually different than StdioHost,
+	// it might just log or broadcast UI requests.
+	// For now, let's reuse StdioHost logic but using logging
+	headlessHost := host.NewStdioHost(cwd)
+
+	modesManager := modes.NewManager(cwd)
+	mcpHub := mcp.NewHub(cwd)
+	cg := codegraph.NewService()
+
+	wsHub = NewWsHub()
+	go wsHub.Run(ctx)
+
+	handler := server.NewHandler(
+		ctx,
+		cfg,
+		liveModeConfig,
+		settingsStore,
+		headlessHost,
+		modesManager,
+		mcpHub,
+		cg,
+		nil,
+	)
+
+	http.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			log.Println("Upgrade error:", err)
+			return
+		}
+
+		wsHub.register <- conn
+
+		wsWriter := &WsWriter{conn: conn}
+
+		// Read Loop
+		go func() {
+			defer func() {
+				wsHub.unregister <- conn
+			}()
+
+			for {
+				var msg protocol.RPCMessage
+				err := conn.ReadJSON(&msg)
+				if err != nil {
+					log.Printf("Read error: %v", err)
+					break
+				}
+
+				// Ensure ID is string (JS JSON often sends numbers)
+
+				// Handle response
+				if msg.Type == "response" {
+					continue
+				}
+
+				// Special handling for Chat Message to broadcast updates
+				if msg.Type == "chat_message" {
+					// We want updates to go to EVERYONE, not just the caller
+					broadcastWriter := &BroadcastWriter{hub: wsHub}
+					handler.HandleMessage(msg, broadcastWriter)
+				} else {
+					// Other requests (get_state, etc) go back to caller only
+					handler.HandleMessage(msg, wsWriter)
+				}
+			}
+		}()
+	})
+
+	log.Printf("Listening on :%s", port)
+	server := &http.Server{Addr: ":" + port, Handler: nil}
+
+	go func() {
+		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("ListenAndServe error: %v", err)
+		}
+	}()
+
+	// Wait for shutdown trigger
+	<-ctx.Done()
+
+	ctxShut, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	server.Shutdown(ctxShut)
+}
+
 // runMCPMode runs as MCP server (for Claude Code, Cursor, etc.)
 func runMCPMode(ctx context.Context) {
 	log.Println("Starting in MCP mode...")
-
-	// TODO: Import and run MCP server from internal/mcp
 	log.Println("MCP server not yet integrated into unified binary")
-
 	<-ctx.Done()
 }
 
-// handleMessage processes incoming messages
-func handleMessage(ctx context.Context, msg protocol.RPCMessage) {
-	switch msg.Type {
-	case "get_state":
-		var payload struct {
-			SessionID string `json:"session_id"`
-		}
-		json.Unmarshal(msg.Payload, &payload)
-		sessionID := payload.SessionID
-		if sessionID == "" {
-			sessionID = "default"
-		}
-
-		if agentController != nil {
-			state := agentController.GetState(sessionID)
-			sendMessage(protocol.RPCMessage{
-				ID:      msg.ID,
-				Type:    "state",
-				Payload: protocol.EncodeRPC(state),
-			})
-		} else {
-			sendMessage(protocol.RPCMessage{
-				ID:   msg.ID,
-				Type: "state",
-				Payload: protocol.EncodeRPC(map[string]interface{}{
-					"messages":        []interface{}{},
-					"liveModeEnabled": false,
-				}),
-			})
-		}
-
-	case "list_sessions":
-		if agentController != nil {
-			sessions := agentController.ListSessions()
-			sendMessage(protocol.RPCMessage{
-				ID:      msg.ID,
-				Type:    "session_list",
-				Payload: protocol.EncodeRPC(map[string]interface{}{"sessions": sessions}),
-			})
-		} else {
-			sendMessage(protocol.RPCMessage{
-				ID:      msg.ID,
-				Type:    "session_list",
-				Payload: protocol.EncodeRPC(map[string]interface{}{"sessions": []interface{}{}}),
-			})
-		}
-
-	case "create_session":
-		if agentController == nil {
-			var err error
-			agentController, err = agent.NewController(cfg, agent.ControllerOptions{
-				ProvidersManager: providersManager,
-			})
-			if err != nil {
-				sendMessage(Response{ID: msg.ID, Error: err.Error()})
-				return
-			}
-		}
-		session := agentController.CreateSession()
-		sendMessage(protocol.RPCMessage{
-			ID:      msg.ID,
-			Type:    "session_created",
-			Payload: protocol.EncodeRPC(session),
-		})
-
-	case "delete_session":
-		var payload struct {
-			SessionID string `json:"session_id"`
-		}
-		if err := json.Unmarshal(msg.Payload, &payload); err != nil {
-			sendMessage(Response{ID: msg.ID, Error: err.Error()})
-			return
-		}
-		if agentController != nil {
-			agentController.DeleteSession(payload.SessionID)
-		}
-		sendMessage(Response{ID: msg.ID, Type: "session_deleted"})
-
-	case "chat_message":
-		var payload struct {
-			Content string `json:"content"`
-		}
-		if err := json.Unmarshal(msg.Payload, &payload); err != nil {
-			sendMessage(protocol.RPCMessage{ID: msg.ID, Error: err.Error()})
-			return
-		}
-
-		log.Printf("Received chat message: %s", payload.Content)
-
-		// Check if we have API key configured
-		if cfg.Provider.APIKey == "" {
-			sendMessage(protocol.RPCMessage{
-				ID:    msg.ID,
-				Type:  "response",
-				Error: "⚠️ API key not configured. Please go to Settings and add your API key (DeepSeek, Gemini, etc.).",
-			})
-			return
-		}
-
-		// Ensure controller is initialized
-		if agentController == nil {
-			initMu.Lock()
-			if agentController == nil {
-				var err error
-				log.Printf("Initializing agent controller with provider %s (%s)", cfg.Provider.Provider, cfg.Provider.Model)
-				agentController, err = agent.NewController(cfg, agent.ControllerOptions{
-					Host:             stdioHost,
-					Modes:            modesManager,
-					McpHub:           mcpHub,
-					ProvidersManager: providersManager,
-				})
-				if err != nil {
-					initMu.Unlock()
-					sendMessage(protocol.RPCMessage{
-						ID:    msg.ID,
-						Type:  "response",
-						Error: fmt.Sprintf("Failed to initialize AI provider: %v", err),
-					})
-					return
-				}
-				if liveModeController != nil {
-					agentController.SetLiveMode(liveModeController)
-				}
-			}
-			initMu.Unlock()
-		}
-
-		// Stream chat response
-		var fullPayload struct {
-			Content   string `json:"content"`
-			SessionID string `json:"session_id"`
-			Via       string `json:"via"`
-		}
-		if err := json.Unmarshal(msg.Payload, &fullPayload); err != nil {
-			sendMessage(protocol.RPCMessage{ID: msg.ID, Error: "Invalid payload: " + err.Error()})
-			return
-		}
-
-		sessionID := fullPayload.SessionID
-		if sessionID == "" {
-			sessionID = "default"
-		}
-
-		err := agentController.Chat(ctx, agent.ChatRequestInput{
-			SessionID: sessionID,
-			Content:   fullPayload.Content,
-			Via:       fullPayload.Via,
-		}, func(update agent.ChatUpdate) {
-			// Forward update to extension
-			sendMessage(protocol.RPCMessage{
-				Type: "chat_update",
-				Payload: protocol.EncodeRPC(map[string]interface{}{
-					"message": update.Message,
-				}),
-			})
-		})
-
-		if err != nil {
-			log.Printf("Chat error: %v", err)
-			sendMessage(protocol.RPCMessage{
-				ID:    msg.ID,
-				Type:  "response",
-				Error: err.Error(),
-			})
-		} else {
-			// CRITICAL: Send final response to resolve extension promise
-			sendMessage(protocol.RPCMessage{
-				ID:      msg.ID,
-				Type:    "response",
-				Payload: protocol.EncodeRPC(map[string]interface{}{"status": "done"}),
-			})
-		}
-
-	case "get_models":
-		log.Println("get_models: Starting...")
-
-		// Initialize providers manager if not done
-		if providersManager == nil {
-			configPath := config.FindConfigFile()
-			log.Printf("get_models: Config path: %s", configPath)
-			pm, err := config.NewProvidersManager(configPath)
-			if err != nil {
-				log.Printf("get_models: Error creating ProvidersManager: %v", err)
-			}
-			providersManager = pm
-		}
-
-		if providersManager == nil {
-			log.Println("get_models: ERROR - providersManager is nil!")
-			sendMessage(protocol.RPCMessage{
-				ID:   msg.ID,
-				Type: "response",
-				Payload: protocol.EncodeRPC(map[string]interface{}{
-					"providers": []interface{}{},
-				}),
-			})
-			return
-		}
-
-		// Set user key from settings if available
-		if settingsStore != nil {
-			s := settingsStore.Get()
-			if s.Provider.APIKey != "" && s.Provider.Provider != "" {
-				providersManager.SetUserKey(s.Provider.Provider, s.Provider.APIKey)
-			}
-		}
-
-		// Get all providers with availability
-		providers := providersManager.GetAvailableProviders()
-		log.Printf("get_models: Got %d providers", len(providers))
-
-		sendMessage(protocol.RPCMessage{
-			ID:   msg.ID,
-			Type: "response",
-			Payload: protocol.EncodeRPC(map[string]interface{}{
-				"providers": providers,
-			}),
-		})
-
-	case "get_settings":
-		if settingsStore == nil {
-			sendMessage(Response{ID: msg.ID, Error: "settings store not initialized"})
-			return
-		}
-		s := settingsStore.Get()
-		settings := map[string]interface{}{
-			"provider":       s.Provider.Provider,
-			"model":          s.Provider.Model,
-			"apiKeys":        s.Provider.APIKeys,
-			"telegramToken":  s.LiveMode.TelegramToken,
-			"telegramChatId": s.LiveMode.TelegramChatID,
-			"context":        s.Context,
-			"auto_approval":  s.AutoApproval,
-			"theme":          s.Theme,
-		}
-		sendMessage(Response{ID: msg.ID, Type: "settings_loaded", Payload: settings})
-
-	case "save_settings":
-		var payload struct {
-			APIKeys        map[string]string            `json:"apiKeys"`
-			Provider       string                       `json:"provider"`
-			Model          string                       `json:"model"`
-			TelegramChatID int64                        `json:"telegramChatId"`
-			TelegramToken  string                       `json:"telegramToken"`
-			Context        *config.ContextSettings      `json:"context,omitempty"`
-			AutoApproval   *config.AutoApprovalSettings `json:"auto_approval,omitempty"`
-		}
-		if err := json.Unmarshal(msg.Payload, &payload); err != nil {
-			sendMessage(protocol.RPCMessage{ID: msg.ID, Error: err.Error()})
-			return
-		}
-
-		// Properly disable old controllers before clearing them
-		if liveModeController != nil {
-			log.Println("Disabling old Live Mode controller...")
-			liveModeController.Disable(globalCtx)
-			liveModeController = nil
-		}
-		agentController = nil
-
-		log.Printf("Updating settings: provider=%s, model=%s", payload.Provider, payload.Model)
-
-		if settingsStore != nil {
-			err := settingsStore.Update(func(s *config.Settings) {
-				if len(payload.APIKeys) > 0 {
-					if s.Provider.APIKeys == nil {
-						s.Provider.APIKeys = make(map[string]string)
-					}
-					for providerID, key := range payload.APIKeys {
-						if key != "" {
-							s.Provider.APIKeys[providerID] = key
-							if providersManager != nil {
-								providersManager.SetUserKey(providerID, key)
-							}
-						}
-					}
-					if activeKey, ok := s.Provider.APIKeys[payload.Provider]; ok {
-						cfg.Provider.APIKey = activeKey
-					}
-				}
-				if payload.Provider != "" {
-					s.Provider.Provider = payload.Provider
-					cfg.Provider.Provider = payload.Provider
-				}
-				if payload.Model != "" {
-					s.Provider.Model = payload.Model
-					cfg.Provider.Model = payload.Model
-				}
-				if payload.TelegramToken != "" {
-					s.LiveMode.TelegramToken = payload.TelegramToken
-					liveModeConfig.TelegramToken = payload.TelegramToken
-				}
-				if payload.TelegramChatID != 0 {
-					s.LiveMode.TelegramChatID = payload.TelegramChatID
-					liveModeConfig.TelegramChatID = payload.TelegramChatID
-				}
-				if payload.Context != nil {
-					s.Context = *payload.Context
-					cfg.EnableCodeIndex = s.Context.EnableCodeIndex
-					if s.Context.SlidingWindowSize > 0 {
-						// This is for sliding window pruning, but usually we use tokens.
-						// If user specified a limit in tokens elsewhere we should use it.
-					}
-				}
-				if payload.AutoApproval != nil {
-					s.AutoApproval = *payload.AutoApproval
-				}
-				s.LiveMode.Enabled = s.LiveMode.TelegramToken != ""
-			})
-			if err != nil {
-				log.Printf("Failed to save settings: %v", err)
-			}
-		}
-
-		// Update runtime config with active provider's key
-		if len(payload.APIKeys) > 0 {
-			if key, ok := payload.APIKeys[payload.Provider]; ok {
-				cfg.Provider.APIKey = key
-			}
-		}
-		if payload.Provider != "" {
-			cfg.Provider.Provider = payload.Provider
-		}
-		if payload.Model != "" {
-			cfg.Provider.Model = payload.Model
-		}
-
-		// Update Live Mode config
-		if payload.TelegramToken != "" {
-			liveModeConfig.TelegramToken = payload.TelegramToken
-		}
-		if payload.TelegramChatID != 0 {
-			liveModeConfig.TelegramChatID = payload.TelegramChatID
-			// Don't restrict by user/chat ID - bot is already protected by token
-			liveModeConfig.AllowedUserIDs = []int64{}
-		}
-
-		// Reinitialize agent controller with new config
-		var err error
-		agentController, err = agent.NewController(cfg, agent.ControllerOptions{
-			ProvidersManager: providersManager,
-		})
-		if err != nil {
-			sendMessage(protocol.RPCMessage{ID: msg.ID, Error: err.Error()})
-			return
-		}
-
-		sendMessage(protocol.RPCMessage{
-			ID:   msg.ID,
-			Type: "settings_saved",
-			Payload: protocol.EncodeRPC(map[string]interface{}{
-				"success":           true,
-				"liveModeAvailable": liveModeConfig.TelegramToken != "",
-			}),
-		})
-
-	case "set_live_mode":
-		var payload struct {
-			Enabled bool `json:"enabled"`
-		}
-		if err := json.Unmarshal(msg.Payload, &payload); err != nil {
-			sendMessage(Response{ID: msg.ID, Error: err.Error()})
-			return
-		}
-
-		log.Printf("Live mode set to: %v", payload.Enabled)
-		initMu.Lock()
-
-		// Initialize Live Mode controller if not done (allow without token for demo mode)
-		if liveModeController == nil {
-			var err error
-			liveModeController, err = livemode.New(liveModeConfig, agentController)
-			if err != nil {
-				log.Printf("Failed to create Live Mode controller: %v", err)
-				sendMessage(Response{
-					ID:   msg.ID,
-					Type: "live_mode_status",
-					Payload: map[string]interface{}{
-						"enabled":      false,
-						"error":        err.Error(),
-						"connectedVia": nil,
-					},
-				})
-				return
-			}
-
-			// Set up activity callback to forward events to extension
-			liveModeController.SetOnActivity(func(activity livemode.EtherActivity) {
-				sendMessage(Response{
-					Type: "ether_activity",
-					Payload: map[string]interface{}{
-						"stage":    activity.Stage,
-						"source":   activity.Source,
-						"username": activity.Username,
-						"preview":  activity.Preview,
-					},
-				})
-			})
-
-			// Set up chat update callback to forward messages to extension
-			liveModeController.SetOnChatUpdate(func(update agent.ChatUpdate) {
-				sendMessage(Response{
-					Type:    "chat_update",
-					Payload: update,
-				})
-			})
-
-			if agentController != nil {
-				agentController.SetLiveMode(liveModeController)
-			}
-		}
-		initMu.Unlock()
-
-		if liveModeController == nil {
-			sendMessage(Response{
-				ID:   msg.ID,
-				Type: "live_mode_status",
-				Payload: map[string]interface{}{
-					"enabled":      false,
-					"error":        "Telegram not configured. Please add your Telegram token in Settings.",
-					"connectedVia": nil,
-				},
-			})
-			return
-		}
-
-		// Toggle live mode
-		var status *livemode.Status
-		var err error
-		if payload.Enabled {
-			status, err = liveModeController.Enable(globalCtx)
-		} else {
-			status, err = liveModeController.Disable(globalCtx)
-		}
-
-		if err != nil {
-			log.Printf("Live mode error: %v", err)
-			sendMessage(Response{
-				ID:   msg.ID,
-				Type: "live_mode_status",
-				Payload: map[string]interface{}{
-					"enabled":      false,
-					"error":        err.Error(),
-					"connectedVia": nil,
-				},
-			})
-			return
-		}
-
-		sendMessage(Response{
-			ID:      msg.ID,
-			Type:    "live_mode_status",
-			Payload: status,
-		})
-
-	case "audio_start":
-		audioMu.Lock()
-		audioBuffer = nil
-		audioMu.Unlock()
-		log.Println("Voice recording started")
-
-	case "audio_chunk":
-		var payload struct {
-			Data   string `json:"data"`
-			Format string `json:"format"`
-		}
-		if err := json.Unmarshal(msg.Payload, &payload); err != nil {
-			return
-		}
-		data, err := protocol.DecodeBase64(payload.Data)
-		if err != nil {
-			log.Printf("Failed to decode audio chunk: %v", err)
-			return
-		}
-		audioMu.Lock()
-		audioBuffer = append(audioBuffer, data...)
-		audioMu.Unlock()
-
-	case "audio_stop":
-		log.Println("Voice recording stopped, transcribing...")
-		audioMu.Lock()
-		buffer := audioBuffer
-		audioBuffer = nil
-		audioMu.Unlock()
-
-		if len(buffer) == 0 {
-			return
-		}
-
-		go func() {
-			// Save to temp file
-			tmpFile := filepath.Join(os.TempDir(), fmt.Sprintf("ricochet_voice_%d.webm", os.Getpid()))
-			if err := os.WriteFile(tmpFile, buffer, 0644); err != nil {
-				log.Printf("Failed to save voice temp file: %v", err)
-				return
-			}
-			defer os.Remove(tmpFile)
-
-			// Transcribe (Try OpenAI API if local transcriber is not available)
-			var text string
-			var err error
-
-			if transcriber != nil {
-				text, err = transcriber.Transcribe(tmpFile)
-			} else if os.Getenv("OPENAI_API_KEY") != "" {
-				t := whisper.NewOpenAICloudTranscriber(os.Getenv("OPENAI_API_KEY"))
-				text, err = t.Transcribe(tmpFile)
-			} else {
-				sendMessage(Response{
-					Type: "show_message",
-					Payload: map[string]string{
-						"level": "warning",
-						"text":  "Voice transcription failed: No transcriber configured (local or OpenAI).",
-					},
-				})
-				return
-			}
-
-			if err != nil {
-				log.Printf("Transcription error: %v", err)
-				return
-			}
-
-			log.Printf("Transcribed: %s", text)
-
-			// Send to agent as if it was a chat message
-			if text != "" && agentController != nil {
-				// Inject [Voice] prefix so the agent knows it was a voice command
-				agentController.Chat(globalCtx, agent.ChatRequestInput{
-					SessionID: "default",
-					Content:   "[Voice]: " + text,
-				}, func(update agent.ChatUpdate) {
-					sendMessage(protocol.RPCMessage{
-						Type: "chat_update",
-						Payload: protocol.EncodeRPC(map[string]interface{}{
-							"message": update.Message,
-						}),
-					})
-				})
-			}
-		}()
-
-	case "clear_chat":
-		log.Println("Clearing chat")
-		if agentController != nil {
-			var payload struct {
-				SessionID string `json:"session_id"`
-			}
-			json.Unmarshal(msg.Payload, &payload)
-			sid := payload.SessionID
-			if sid == "" {
-				sid = "default"
-			}
-			agentController.ClearSession(sid)
-		}
-		sendMessage(Response{ID: msg.ID, Type: "chat_cleared"})
-
-	case "checkpoint_init":
-		// Get workspace and storage dirs
-		cwd, _ := os.Getwd()
-		homeDir, _ := os.UserHomeDir()
-		storageDir := filepath.Join(homeDir, ".ricochet")
-
-		// Create checkpoint service with task ID from payload (or default)
-		var payload struct {
-			TaskID string `json:"taskId"`
-		}
-		json.Unmarshal(msg.Payload, &payload)
-		if payload.TaskID == "" {
-			payload.TaskID = "default"
-		}
-
-		checkpointService = checkpoints.NewCheckpointService(payload.TaskID, cwd, storageDir)
-		if err := checkpointService.Init(); err != nil {
-			sendMessage(Response{ID: msg.ID, Error: fmt.Sprintf("checkpoint init failed: %v", err)})
-			return
-		}
-
-		sendMessage(Response{
-			ID:   msg.ID,
-			Type: "checkpoint_initialized",
-			Payload: map[string]interface{}{
-				"baseHash":  checkpointService.BaseHash(),
-				"workspace": cwd,
-			},
-		})
-
-	case "checkpoint_save":
-		if checkpointService == nil {
-			sendMessage(Response{ID: msg.ID, Error: "checkpoint service not initialized"})
-			return
-		}
-
-		var payload struct {
-			Message string `json:"message"`
-		}
-		json.Unmarshal(msg.Payload, &payload)
-
-		hash, err := checkpointService.Save(payload.Message)
-		if err != nil {
-			sendMessage(Response{ID: msg.ID, Error: fmt.Sprintf("checkpoint save failed: %v", err)})
-			return
-		}
-
-		sendMessage(Response{
-			ID:   msg.ID,
-			Type: "checkpoint_saved",
-			Payload: map[string]interface{}{
-				"hash":    hash,
-				"message": payload.Message,
-			},
-		})
-
-	case "checkpoint_restore":
-		if checkpointService == nil {
-			sendMessage(Response{ID: msg.ID, Error: "checkpoint service not initialized"})
-			return
-		}
-
-		var payload struct {
-			Hash string `json:"hash"`
-		}
-		if err := json.Unmarshal(msg.Payload, &payload); err != nil {
-			sendMessage(Response{ID: msg.ID, Error: err.Error()})
-			return
-		}
-
-		if err := checkpointService.Restore(payload.Hash); err != nil {
-			sendMessage(Response{ID: msg.ID, Error: fmt.Sprintf("checkpoint restore failed: %v", err)})
-			return
-		}
-
-		sendMessage(Response{
-			ID:   msg.ID,
-			Type: "checkpoint_restored",
-			Payload: map[string]interface{}{
-				"hash": payload.Hash,
-			},
-		})
-
-	case "checkpoint_list":
-		if checkpointService == nil {
-			sendMessage(Response{ID: msg.ID, Error: "checkpoint service not initialized"})
-			return
-		}
-
-		sendMessage(Response{
-			ID:   msg.ID,
-			Type: "checkpoint_list",
-			Payload: map[string]interface{}{
-				"checkpoints": checkpointService.List(),
-				"baseHash":    checkpointService.BaseHash(),
-			},
-		})
-
-	case "get_all_settings":
-		settings := settingsStore.Get()
-		sendMessage(Response{
-			ID:   msg.ID,
-			Type: "settings",
-			Payload: map[string]interface{}{
-				"provider":      settings.Provider,
-				"live_mode":     settings.LiveMode,
-				"context":       settings.Context,
-				"auto_approval": settings.AutoApproval,
-				"theme":         settings.Theme,
-			},
-		})
-
-	case "update_auto_approval":
-		var payload struct {
-			Enabled             *bool `json:"enabled,omitempty"`
-			ReadFiles           *bool `json:"read_files,omitempty"`
-			ReadFilesExternal   *bool `json:"read_files_external,omitempty"`
-			EditFiles           *bool `json:"edit_files,omitempty"`
-			EditFilesExternal   *bool `json:"edit_files_external,omitempty"`
-			ExecuteSafeCommands *bool `json:"execute_safe_commands,omitempty"`
-			ExecuteAllCommands  *bool `json:"execute_all_commands,omitempty"`
-			UseBrowser          *bool `json:"use_browser,omitempty"`
-			UseMCP              *bool `json:"use_mcp,omitempty"`
-		}
-		if err := json.Unmarshal(msg.Payload, &payload); err != nil {
-			sendMessage(Response{ID: msg.ID, Error: err.Error()})
-			return
-		}
-
-		if err := settingsStore.Update(func(s *config.Settings) {
-			if payload.Enabled != nil {
-				s.AutoApproval.Enabled = *payload.Enabled
-			}
-			if payload.ReadFiles != nil {
-				s.AutoApproval.ReadFiles = *payload.ReadFiles
-			}
-			if payload.ReadFilesExternal != nil {
-				s.AutoApproval.ReadFilesExternal = *payload.ReadFilesExternal
-			}
-			if payload.EditFiles != nil {
-				s.AutoApproval.EditFiles = *payload.EditFiles
-			}
-			if payload.EditFilesExternal != nil {
-				s.AutoApproval.EditFilesExternal = *payload.EditFilesExternal
-			}
-			if payload.ExecuteSafeCommands != nil {
-				s.AutoApproval.ExecuteSafeCommands = *payload.ExecuteSafeCommands
-			}
-			if payload.ExecuteAllCommands != nil {
-				s.AutoApproval.ExecuteAllCommands = *payload.ExecuteAllCommands
-			}
-			if payload.UseBrowser != nil {
-				s.AutoApproval.UseBrowser = *payload.UseBrowser
-			}
-			if payload.UseMCP != nil {
-				s.AutoApproval.UseMCP = *payload.UseMCP
-			}
-		}); err != nil {
-			sendMessage(Response{ID: msg.ID, Error: err.Error()})
-			return
-		}
-
-		settings := settingsStore.Get()
-		sendMessage(Response{
-			ID:   msg.ID,
-			Type: "settings_updated",
-			Payload: map[string]interface{}{
-				"auto_approval": settings.AutoApproval,
-			},
-		})
-
-	case "update_context_settings":
-		var payload struct {
-			AutoCondense         *bool `json:"auto_condense,omitempty"`
-			CondenseThreshold    *int  `json:"condense_threshold,omitempty"`
-			ShowContextIndicator *bool `json:"show_context_indicator,omitempty"`
-			EnableCheckpoints    *bool `json:"enable_checkpoints,omitempty"`
-			CheckpointOnWrites   *bool `json:"checkpoint_on_writes,omitempty"`
-		}
-		if err := json.Unmarshal(msg.Payload, &payload); err != nil {
-			sendMessage(Response{ID: msg.ID, Error: err.Error()})
-			return
-		}
-
-		if err := settingsStore.Update(func(s *config.Settings) {
-			if payload.AutoCondense != nil {
-				s.Context.AutoCondense = *payload.AutoCondense
-			}
-			if payload.CondenseThreshold != nil {
-				s.Context.CondenseThreshold = *payload.CondenseThreshold
-			}
-			if payload.ShowContextIndicator != nil {
-				s.Context.ShowContextIndicator = *payload.ShowContextIndicator
-			}
-			if payload.EnableCheckpoints != nil {
-				s.Context.EnableCheckpoints = *payload.EnableCheckpoints
-			}
-			if payload.CheckpointOnWrites != nil {
-				s.Context.CheckpointOnWrites = *payload.CheckpointOnWrites
-			}
-		}); err != nil {
-			sendMessage(Response{ID: msg.ID, Error: err.Error()})
-			return
-		}
-
-		settings := settingsStore.Get()
-		sendMessage(Response{
-			ID:   msg.ID,
-			Type: "settings_updated",
-			Payload: map[string]interface{}{
-				"context": settings.Context,
-			},
-		})
-
-	default:
-		sendMessage(Response{ID: msg.ID, Error: fmt.Sprintf("unknown message type: %s", msg.Type)})
-	}
-}
-
-// sendMessage writes any JSON serializable value to stdout (thread-safe)
-func sendMessage(v interface{}) {
+func sendMessage(msg interface{}) {
 	outputMu.Lock()
 	defer outputMu.Unlock()
 
-	data, err := json.Marshal(v)
+	data, err := json.Marshal(msg)
 	if err != nil {
-		log.Printf("Failed to marshal response: %v", err)
+		log.Printf("Failed to marshal message: %v", err)
 		return
 	}
-	log.Printf("SENDING RESPONSE: %s", string(data))
-	fmt.Println(string(data))
-	os.Stdout.Sync()
+	fmt.Printf("%s\n", data)
 }

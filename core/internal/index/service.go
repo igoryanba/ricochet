@@ -58,7 +58,6 @@ func (idx *Indexer) IndexAll(ctx context.Context) error {
 			return err
 		}
 		if info.IsDir() {
-			// Skip hidden and dependency directories
 			name := info.Name()
 			if strings.HasPrefix(name, ".") || name == "node_modules" || name == "vendor" || name == "dist" || name == "out" {
 				return filepath.SkipDir
@@ -66,7 +65,6 @@ func (idx *Indexer) IndexAll(ctx context.Context) error {
 			return nil
 		}
 
-		// Check if extension is supported by parser
 		ext := strings.ToLower(filepath.Ext(path))
 		switch ext {
 		case ".js", ".jsx", ".ts", ".tsx", ".py", ".rs", ".go":
@@ -78,7 +76,7 @@ func (idx *Indexer) IndexAll(ctx context.Context) error {
 		docs, err := idx.indexFile(ctx, path)
 		if err != nil {
 			fmt.Printf("Warning: failed to index file %s: %v\n", path, err)
-			return nil // Continue with other files
+			return nil
 		}
 
 		allDocs = append(allDocs, docs...)
@@ -90,7 +88,22 @@ func (idx *Indexer) IndexAll(ctx context.Context) error {
 	}
 
 	if len(allDocs) > 0 {
-		// Generate embeddings in batches
+		// 1. Build Dependency Graph and Compute PageRank
+		graph := NewDependencyGraph()
+		graph.BuildGraph(allDocs)
+		graph.ComputePageRank(0.85, 20) // Standard damping factor
+
+		// 2. Assign PageRank to documents
+		for i := range allDocs {
+			if node, ok := graph.Nodes[allDocs[i].FilePath]; ok {
+				if allDocs[i].Metadata == nil {
+					allDocs[i].Metadata = make(map[string]interface{})
+				}
+				allDocs[i].Metadata["pagerank"] = node.PageRank
+			}
+		}
+
+		// 3. Generate embeddings
 		batchSize := 20
 		for i := 0; i < len(allDocs); i += batchSize {
 			end := i + batchSize
@@ -133,56 +146,67 @@ func (idx *Indexer) indexFile(ctx context.Context, path string) ([]Document, err
 
 	relPath, _ := filepath.Rel(idx.workspaceRoot, path)
 
-	// Try to get definitions (functions, classes) for logical chunking
-	defs, err := idx.parser.ParseDefinitions(ctx, path, content)
+	// Try to get definitions (functions, classes) and imports
+	analysis, err := idx.parser.ParseDefinitions(ctx, path, content)
 	if err != nil {
-		// Fallback to simple line-based chunking if treesitter fails or unsupported
 		return idx.chunkSimple(relPath, string(content)), nil
 	}
 
 	var docs []Document
 	lines := strings.Split(string(content), "\n")
 
-	for _, def := range defs {
-		// Ensure line ranges are valid
-		start := def.LineStart - 1
-		end := def.LineEnd
-		if start < 0 {
-			start = 0
-		}
-		if end > len(lines) {
-			end = len(lines)
-		}
-		if start >= end {
-			continue
-		}
+	// Store file-level metadata (imports) in every chunk derived from this file
+	// or create a dedicated "File" chunk?
+	// For now, we propagate imports to all chunks so the graph builder can pick any.
 
-		chunk := strings.Join(lines[start:end], "\n")
-		// Limit chunk size to avoid context issues (embeddings usually have tokens limit)
-		if len(chunk) > 8000 {
-			chunk = chunk[:8000]
-		}
+	// If definitions exist, chunk by definitions
+	if len(analysis.Definitions) > 0 {
+		for _, def := range analysis.Definitions {
+			start := def.LineStart - 1
+			end := def.LineEnd
+			if start < 0 {
+				start = 0
+			}
+			if end > len(lines) {
+				end = len(lines)
+			}
+			if start >= end {
+				continue
+			}
 
-		docs = append(docs, Document{
-			ID:        fmt.Sprintf("%s:%d-%d", relPath, def.LineStart, def.LineEnd),
-			FilePath:  relPath,
-			Content:   fmt.Sprintf("// File: %s\n// %s: %s\n%s", relPath, def.Type, def.Name, chunk),
-			LineStart: def.LineStart,
-			LineEnd:   def.LineEnd,
-			Metadata:  map[string]interface{}{"type": def.Type, "name": def.Name},
-		})
+			chunk := strings.Join(lines[start:end], "\n")
+			if len(chunk) > 8000 {
+				chunk = chunk[:8000]
+			}
+
+			docs = append(docs, Document{
+				ID:        fmt.Sprintf("%s:%d-%d", relPath, def.LineStart, def.LineEnd),
+				FilePath:  relPath,
+				Content:   fmt.Sprintf("// File: %s\n// %s: %s\n%s", relPath, def.Type, def.Name, chunk),
+				LineStart: def.LineStart,
+				LineEnd:   def.LineEnd,
+				Metadata: map[string]interface{}{
+					"type":    def.Type,
+					"name":    def.Name,
+					"imports": analysis.Imports, // Add imports to metadata
+				},
+			})
+		}
 	}
 
-	// If no definitions found but file is not empty, add one big chunk or simple chunks
+	// Always add a "whole file" summary or if chunks were empty
 	if len(docs) == 0 && len(content) > 0 {
-		return idx.chunkSimple(relPath, string(content)), nil
+		return idx.chunkSimpleWithImports(relPath, string(content), analysis.Imports), nil
 	}
 
 	return docs, nil
 }
 
 func (idx *Indexer) chunkSimple(relPath, content string) []Document {
-	// Split by ~50 lines if no AST structure found
+	return idx.chunkSimpleWithImports(relPath, content, nil)
+}
+
+func (idx *Indexer) chunkSimpleWithImports(relPath, content string, imports []string) []Document {
 	lines := strings.Split(content, "\n")
 	chunkSize := 50
 	var docs []Document
@@ -194,13 +218,20 @@ func (idx *Indexer) chunkSimple(relPath, content string) []Document {
 		}
 
 		chunk := strings.Join(lines[i:end], "\n")
-		docs = append(docs, Document{
+		doc := Document{
 			ID:        fmt.Sprintf("%s:%d-%d", relPath, i+1, end),
 			FilePath:  relPath,
 			Content:   fmt.Sprintf("// File: %s (Lines %d-%d)\n%s", relPath, i+1, end, chunk),
 			LineStart: i + 1,
 			LineEnd:   end,
-		})
+			Metadata:  make(map[string]interface{}),
+		}
+
+		if imports != nil {
+			doc.Metadata["imports"] = imports
+		}
+
+		docs = append(docs, doc)
 	}
 	return docs
 }
@@ -214,5 +245,40 @@ func (idx *Indexer) Search(ctx context.Context, query string, limit int) ([]Sear
 		return nil, nil
 	}
 
-	return idx.store.Search(emb[0], limit)
+	// This is where we would ideally combine vector score with PageRank
+	// But LocalStore.Search is naive.
+	// We should probably modify LocalStore.Search or re-rank here.
+
+	results, err := idx.store.Search(emb[0], limit*2) // Get more results to re-rank
+	if err != nil {
+		return nil, err
+	}
+
+	// Simple re-ranking: Score = VectorScore * (1 + PageRank_Boost)
+	// Assuming PageRank is small (e.g. 0.001 to 0.1), we normalize it or just add it.
+
+	for i := range results {
+		if pr, ok := results[i].Document.Metadata["pagerank"].(float64); ok {
+			// Boost factor. If PR is high, we boost.
+			// Vector scores are usually 0.7-0.9.
+			// Let's say PR can boost up to 20%.
+			// Need to normalize PR? For now just raw addition with weight.
+			results[i].Score = results[i].Score + (pr * 100.0) // Heuristic: PR is usually small (1/N)
+		}
+	}
+
+	// Sort again
+	for i := 0; i < len(results); i++ {
+		for j := i + 1; j < len(results); j++ {
+			if results[i].Score < results[j].Score {
+				results[i], results[j] = results[j], results[i]
+			}
+		}
+	}
+
+	if len(results) > limit {
+		results = results[:limit]
+	}
+
+	return results, nil
 }

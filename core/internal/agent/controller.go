@@ -12,8 +12,10 @@ import (
 	"time"
 
 	"github.com/igoryan-dao/ricochet/internal/checkpoints"
+	"github.com/igoryan-dao/ricochet/internal/codegraph"
 	"github.com/igoryan-dao/ricochet/internal/config"
 	context_manager "github.com/igoryan-dao/ricochet/internal/context"
+	"github.com/igoryan-dao/ricochet/internal/context/handoff"
 	"github.com/igoryan-dao/ricochet/internal/host"
 	"github.com/igoryan-dao/ricochet/internal/index"
 	mcpHubPkg "github.com/igoryan-dao/ricochet/internal/mcp"
@@ -40,15 +42,19 @@ type Controller struct {
 	checkpointService *checkpoints.CheckpointService
 	providersManager  *config.ProvidersManager
 	indexer           *index.Indexer
+
+	codegraph      *codegraph.Service
+	handoffService *handoff.Service
 }
 
 // Config holds agent configuration
 type Config struct {
-	Provider        ProviderConfig `json:"provider"`
-	SystemPrompt    string         `json:"system_prompt"`
-	MaxTokens       int            `json:"max_tokens"`     // Max tokens for response generation
-	ContextWindow   int            `json:"context_window"` // Context window limit for pruning
-	EnableCodeIndex bool           `json:"enable_code_index"`
+	Provider          ProviderConfig  `json:"provider"`
+	EmbeddingProvider *ProviderConfig `json:"embedding_provider,omitempty"`
+	SystemPrompt      string          `json:"system_prompt"`
+	MaxTokens         int             `json:"max_tokens"`     // Max tokens for response generation
+	ContextWindow     int             `json:"context_window"` // Context window limit for pruning
+	EnableCodeIndex   bool            `json:"enable_code_index"`
 }
 
 // Session represents a chat session
@@ -68,6 +74,7 @@ type ControllerOptions struct {
 	Rules            *rules.Manager
 	McpHub           *mcpHubPkg.Hub
 	ProvidersManager *config.ProvidersManager
+	Codegraph        *codegraph.Service
 }
 
 // NewController creates a new agent controller
@@ -84,6 +91,7 @@ func NewController(cfg *Config, opts ...ControllerOptions) (*Controller, error) 
 	var rm *rules.Manager
 	var mcpHub *mcpHubPkg.Hub
 	var pm *config.ProvidersManager
+	var cg *codegraph.Service
 
 	if len(opts) > 0 {
 		h = opts[0].Host
@@ -91,6 +99,7 @@ func NewController(cfg *Config, opts ...ControllerOptions) (*Controller, error) 
 		rm = opts[0].Rules
 		mcpHub = opts[0].McpHub
 		pm = opts[0].ProvidersManager
+		cg = opts[0].Codegraph
 	}
 
 	if h == nil {
@@ -103,6 +112,7 @@ func NewController(cfg *Config, opts ...ControllerOptions) (*Controller, error) 
 		rm = rules.NewManager(cwd)
 	}
 	// mcpHub can be nil
+	// cg (codegraph) can be nil (feature disabled or not provided)
 
 	// Initialize safeguard manager
 	safeguardMgr, err := safeguard.NewManager(cwd)
@@ -110,12 +120,30 @@ func NewController(cfg *Config, opts ...ControllerOptions) (*Controller, error) 
 		log.Printf("Warning: Failed to initialize safeguard manager: %v", err)
 	}
 
+	// Initialize Embedder
+	// If EmbeddingProvider is configured, use it. Otherwise try to use main provider.
+	var embedder index.Embedder
+	embedder = provider // Default: use main provider (if it implements Embedder)
+
+	if cfg.EmbeddingProvider != nil && cfg.EmbeddingProvider.Provider != "" {
+		embProv, err := NewProvider(*cfg.EmbeddingProvider)
+		if err != nil {
+			log.Printf("Warning: Failed to create embedding provider: %v. Falling back to main provider.", err)
+		} else {
+			embedder = embProv
+			log.Printf("Using separate embedding provider: %s", cfg.EmbeddingProvider.Provider)
+		}
+	} else if provider.Name() == "anthropic" {
+		// Specific warning for Anthropic which doesn't support embeddings
+		log.Printf("Warning: Main provider is Anthropic (no embeddings) and no separate embedding provider configured. Codebase search will not work.")
+	}
+
 	// Initialize indexer
 	indexPath := filepath.Join(os.Getenv("HOME"), ".ricochet", "index.vdb")
 	store, _ := index.NewLocalStore(indexPath)
-	indexer := index.NewIndexer(store, provider, cwd)
+	indexer := index.NewIndexer(store, embedder, cwd)
 
-	executor := tools.NewNativeExecutor(h, mm, safeguardMgr, mcpHub, indexer)
+	executor := tools.NewNativeExecutor(h, mm, safeguardMgr, mcpHub, indexer, cg)
 
 	// Trigger indexing in background
 	if cfg.EnableCodeIndex {
@@ -125,6 +153,25 @@ func NewController(cfg *Config, opts ...ControllerOptions) (*Controller, error) 
 				log.Printf("Background indexing failed: %v", err)
 			}
 		}()
+
+		// Also trigger CodeGraph rebuild if available
+		if cg != nil {
+			go func() {
+				start := time.Now()
+				log.Printf("Building code graph...")
+				if err := cg.Rebuild(cwd); err != nil {
+					log.Printf("Code graph rebuild failed: %v", err)
+				} else {
+					log.Printf("Code graph built in %v (files: %d)", time.Since(start), len(cg.GetAllFiles()))
+
+					// Compute PageRank (takes a few iterations)
+					log.Printf("Computing PageRank...")
+					prStart := time.Now()
+					cg.CalculatePageRank()
+					log.Printf("PageRank computed in %v", time.Since(prStart))
+				}
+			}()
+		}
 	}
 
 	// Initialize session manager
@@ -143,6 +190,18 @@ func NewController(cfg *Config, opts ...ControllerOptions) (*Controller, error) 
 		host:             h,
 		providersManager: pm,
 		indexer:          indexer,
+		handoffService: handoff.NewService(func(ctx context.Context, prompt string) (string, error) {
+			req := &ChatRequest{
+				Model:     cfg.Provider.Model,
+				Messages:  []protocol.Message{{Role: "user", Content: prompt}},
+				MaxTokens: 4000,
+			}
+			resp, err := provider.Chat(ctx, req)
+			if err != nil {
+				return "", err
+			}
+			return resp.Content, nil
+		}),
 	}, nil
 }
 
@@ -336,37 +395,43 @@ func (c *Controller) Chat(ctx context.Context, input ChatRequestInput, callback 
 		log.Printf("[Agent] Starting context management. Limit: %d, WindowSize: %d, Msgs: %d, Provider: %s",
 			contextLimit, c.config.ContextWindow, len(currentMessages), c.config.Provider.Provider)
 
-		wm := context_manager.NewWindowManager(contextLimit)
-		// Add custom settings from config if available (phase 12)
-		// For now using defaults in NewWindowManager
+		// Initialize Condense Adapter
+		condenseProvider := &condenseAdapter{
+			p:     c.provider,
+			model: c.config.Provider.Model,
+		}
+
+		// Configure Smart Context settings
+		ctxSettings := &context_manager.ContextSettings{
+			AutoCondense:         true,
+			CondenseThreshold:    75, // Start condensing at 75% usage to be safe
+			SlidingWindowSize:    20,
+			ShowContextIndicator: true,
+		}
+
+		wm := context_manager.NewWindowManagerWithSettings(contextLimit, ctxSettings, condenseProvider)
+
 		contextResult, err := wm.ManageContext(ctx, currentMessages, c.config.SystemPrompt)
 		if err != nil {
-			log.Printf("Context management warning: %v", err)
+			return fmt.Errorf("context management failed: %w", err)
 		}
-		prunedMessages := contextResult.Messages
 
-		// Log context status
-		statusEmoji := ""
-		if contextResult.WasCondensed {
-			statusEmoji = " 📦"
-		} else if contextResult.WasTruncated {
-			statusEmoji = " ✂️"
+		// Inject CodeGraph Repo Map if available (Repo Intelligence)
+		// We insert it as a User message at the very beginning of HISTORY (or strictly after System Prompt).
+		// Since we handle contextResult.Messages which are the messages sent to LLM,
+		// we can prepend a User message if it's the first turn or if we want it persistent.
+		// However, context manager might have pruned.
+		// A better strategy is to append it to the System Prompt, or use a "Developer" role message if supported.
+		// Let's modify System Prompt for this turn.
+
+		finalSystemPrompt := contextResult.SystemPrompt
+		if c.codegraph != nil {
+			// Limit size: 5% of context window or max 100 files
+			repoMap := c.codegraph.GenerateRepoMap(100)
+			if repoMap != "" {
+				finalSystemPrompt += "\n\n" + repoMap + "\n\n(This repository map is auto-generated based on Code Graph PageRank analysis)"
+			}
 		}
-		log.Printf("Context: %.1f%% (%d/%d tokens, %d msgs)%s",
-			contextResult.Percentage, contextResult.TokensUsed, contextResult.TokensMax, len(prunedMessages), statusEmoji)
-
-		// Emit context status to frontend
-		callback(ChatUpdate{
-			SessionID: input.SessionID,
-			ContextStatus: &protocol.ContextStatus{
-				TokensUsed:     contextResult.TokensUsed,
-				TokensMax:      contextResult.TokensMax,
-				Percentage:     contextResult.Percentage,
-				WasCondensed:   contextResult.WasCondensed,
-				WasTruncated:   contextResult.WasTruncated,
-				CumulativeCost: session.TotalCost,
-			},
-		})
 
 		// Build request
 		// Build request with enhanced context including Active Mode and Project Rules
@@ -378,7 +443,17 @@ func (c *Controller) Chat(ctx context.Context, input ChatRequestInput, callback 
 
 		rulesContext := c.rules.GetRules()
 
-		enhancedSystemPrompt := c.config.SystemPrompt + modePrompt + rulesContext + "\n\n" + c.envTracker.GetContext() + "\n" + session.FileTracker.GetContext()
+		// Combine system prompt parts (Base + Mode + Rules + RepoMap if any)
+		// Usually Controller logic appends to c.config.SystemPrompt,
+		// but here finalSystemPrompt already has repoMap if any.
+		// Let's ensure we merge correctly.
+		// If Repomap was appended to finalSystemPrompt, we should use that base.
+
+		// Re-construct system prompt to be safe and ordered
+		enhancedSystemPrompt := finalSystemPrompt + modePrompt + rulesContext + "\n\n" + c.envTracker.GetContext() + "\n" + session.FileTracker.GetContext()
+
+		// Use contextResult.Messages as prunedMessages
+		prunedMessages := contextResult.Messages
 
 		req := &ChatRequest{
 			Model:        c.config.Provider.Model,
@@ -428,17 +503,34 @@ func (c *Controller) Chat(ctx context.Context, input ChatRequestInput, callback 
 		turnCost := calcCost(totalTokensIn, totalTokensOut)
 		session.TotalCost += turnCost
 
-		assistantMsg.Metadata = &TaskMetadata{
-			TokensIn:     totalTokensIn,
-			TokensOut:    totalTokensOut,
-			TotalCost:    turnCost,
-			ContextLimit: c.config.MaxTokens,
+		// Log context status
+		statusEmoji := ""
+		if contextResult.WasCondensed {
+			statusEmoji = " 📦"
+		} else if contextResult.WasTruncated {
+			statusEmoji = " ✂️"
 		}
+		log.Printf("Context: %.1f%% (%d/%d tokens, %d msgs)%s",
+			contextResult.Percentage, contextResult.TokensUsed, contextResult.TokensMax, len(prunedMessages), statusEmoji)
+
+		// Emit context status to frontend
+		callback(ChatUpdate{
+			SessionID: input.SessionID,
+			ContextStatus: &protocol.ContextStatus{
+				TokensUsed:     contextResult.TokensUsed,
+				TokensMax:      contextResult.TokensMax,
+				Percentage:     contextResult.Percentage,
+				WasCondensed:   contextResult.WasCondensed,
+				WasTruncated:   contextResult.WasTruncated,
+				CumulativeCost: session.TotalCost,
+			},
+		})
 
 		var currentTurnContent string
 		var currentTurnToolCalls []ToolCallInfo
 
-		// Stream response from AI
+		// Stream response from AI using standard ChatStream
+		// We use prunedMessages (from context management) instead of session messages
 		err = c.provider.ChatStream(ctx, req, func(chunk *StreamChunk) error {
 			switch chunk.Type {
 			case "content_block_delta":
@@ -527,7 +619,8 @@ func (c *Controller) Chat(ctx context.Context, input ChatRequestInput, callback 
 			var result string
 			var err error
 
-			if tc.Name == "update_todos" {
+			switch tc.Name {
+			case "update_todos":
 				var payload struct {
 					Todos []protocol.Todo `json:"todos"`
 				}
@@ -537,7 +630,41 @@ func (c *Controller) Chat(ctx context.Context, input ChatRequestInput, callback 
 				} else {
 					result = fmt.Sprintf("Error parsing todos: %v", err)
 				}
-			} else {
+			case "switch_mode":
+				var payload struct {
+					Mode    string `json:"mode"`
+					Handoff bool   `json:"handoff"`
+				}
+				if err = json.Unmarshal([]byte(tc.Arguments), &payload); err == nil {
+					// 1. Execute mode switch
+					result, err = c.executor.Execute(ctx, tc.Name, json.RawMessage(tc.Arguments))
+					if err == nil && payload.Handoff {
+						// 2. Trigger Handoff
+						log.Printf("🧠 Triggering Intelligent Handoff...")
+						cwd, _ := os.Getwd()
+
+						// Summarize history (exclude current tool call)
+						msgs := session.StateHandler.GetMessages()
+						spec, hErr := c.handoffService.GenerateSpec(ctx, msgs)
+						if hErr != nil {
+							log.Printf("Handoff generation failed: %v", hErr)
+							result += fmt.Sprintf("\n(Warning: Handoff failed: %v)", hErr)
+						} else {
+							sErr := c.handoffService.SaveSpec(cwd, spec)
+							if sErr != nil {
+								log.Printf("Handoff save failed: %v", sErr)
+							} else {
+								// 3. Condense Context: Re-initialize session but keep ID
+								// For now, we just log it. Real pruning happens in ContextManager anyway.
+								// But to "Start Fresh", we could archive messages.
+								result += "\n\n🧠 **Intelligent Handoff Complete**\nContext condensed into `SPEC.md`. Mode switched."
+							}
+						}
+					}
+				} else {
+					result = fmt.Sprintf("Error parsing switch_mode args: %v", err)
+				}
+			default:
 				result, err = c.executor.Execute(ctx, tc.Name, json.RawMessage(tc.Arguments))
 			}
 			isError := false
@@ -797,6 +924,29 @@ func (c *Controller) UpdateTodos(sessionID string, todos []protocol.Todo) {
 			}),
 		})
 	}
+}
+
+// condenseAdapter wraps the main AI provider to satisfy the CondenseProvider interface
+type condenseAdapter struct {
+	p     Provider
+	model string
+}
+
+// Summarize asks the AI to summarize the text
+func (a *condenseAdapter) Summarize(ctx context.Context, prompt string) (string, error) {
+	req := &ChatRequest{
+		Model: a.model,
+		Messages: []protocol.Message{
+			{Role: "user", Content: prompt},
+		},
+		MaxTokens: 4000, // Allow reasonable space for summary
+	}
+
+	resp, err := a.p.Chat(ctx, req)
+	if err != nil {
+		return "", err
+	}
+	return resp.Content, nil
 }
 
 // isWriteTool returns true if the tool modifies workspace files

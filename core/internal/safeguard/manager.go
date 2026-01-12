@@ -11,6 +11,7 @@ import (
 type Manager struct {
 	gitManager      *checkpoint.GitManager
 	PermissionStore *PermissionStore
+	CurrentZone     TrustZone
 }
 
 // NewManager creates a new safeguard manager
@@ -40,6 +41,7 @@ func NewManager(cwd string) (*Manager, error) {
 	return &Manager{
 		gitManager:      gitMgr,
 		PermissionStore: permStore,
+		CurrentZone:     ZoneSafe, // Default to Safe Zone
 	}, nil
 }
 
@@ -51,4 +53,9 @@ func (m *Manager) CreateCheckpoint(message string) (string, error) {
 // RestoreCheckpoint restores the state to a specific checkpoint
 func (m *Manager) RestoreCheckpoint(commitHash string) error {
 	return m.gitManager.Restore(commitHash)
+}
+
+// CheckPermission verifies if the tool execution is allowed in the current zone
+func (m *Manager) CheckPermission(tool string) error {
+	return CheckZonePermission(m.CurrentZone, tool)
 }

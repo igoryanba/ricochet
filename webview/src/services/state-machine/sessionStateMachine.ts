@@ -42,6 +42,7 @@ type RejectActionEvent = { type: "reject_action" }
 type SendMessageEvent = { type: "send_message"; content: string }
 type CancelSessionEvent = { type: "cancel_session" }
 type RetryEvent = { type: "retry" }
+type ChatUpdateEvent = { type: "chat_update"; message: any } // using any for ChatMessage struct for now
 
 export type SessionEvent =
     | StartSessionEvent
@@ -65,6 +66,7 @@ export type SessionEvent =
     | SendMessageEvent
     | CancelSessionEvent
     | CancelSessionEvent
+    | ChatUpdateEvent
     | RetryEvent
 
 export interface SessionUiState {
@@ -82,8 +84,6 @@ export interface SessionStateMachine {
 }
 
 // ============ Context ============
-
-// ============ Context ============
 export interface AgentLogEntry {
     id: string;
     timestamp: number;
@@ -98,6 +98,7 @@ export interface SessionContext {
     sawApiReqStarted: boolean
     sawSessionCreated: boolean
     logs: AgentLogEntry[]
+    currentMessageId?: string // Track current streaming message to update logic
 }
 
 // ...
@@ -124,9 +125,24 @@ export function createSessionStateMachine(): SessionStateMachine {
             const { logs, ...otherUpdates } = contextUpdate;
             context = { ...context, ...otherUpdates }
 
-            // Append Logs if any (array merge)
+            // Intelligent Log Merging Logic
             if (logs) {
-                context.logs = [...context.logs, ...logs];
+                if (event.type === 'chat_update') {
+                    // Update existing log if ID matches
+                    const newLogs = [...context.logs];
+                    logs.forEach(incomingLog => {
+                        const existingIdx = newLogs.findIndex(l => l.id === incomingLog.id);
+                        if (existingIdx !== -1) {
+                            newLogs[existingIdx] = incomingLog;
+                        } else {
+                            newLogs.push(incomingLog);
+                        }
+                    });
+                    context.logs = newLogs;
+                } else {
+                    // Legacy append behavior
+                    context.logs = [...context.logs, ...logs];
+                }
             }
         }
     }
@@ -376,6 +392,56 @@ function transitionFromStreaming(event: SessionEvent): TransitionResult {
                     }]
                 }
             }
+
+        // Streaming updates from backend
+        case "chat_update": {
+            const msg = event.message;
+            const newLogs: AgentLogEntry[] = [];
+
+            // 1. Text Content
+            if (msg.content) {
+                newLogs.push({
+                    id: `log-${msg.id}-text`,
+                    timestamp: msg.timestamp,
+                    type: 'info',
+                    content: msg.content
+                });
+            }
+
+            // 2. Tool Calls
+            if (msg.toolCalls && msg.toolCalls.length > 0) {
+                msg.toolCalls.forEach((tc: any) => {
+                    // Create Tool Call Log
+                    newLogs.push({
+                        id: `log-${tc.id}`, // Stable ID
+                        timestamp: msg.timestamp,
+                        type: 'tool_call',
+                        content: `Executing ${tc.name}...`,
+                        metadata: {
+                            name: tc.name,
+                            args: tc.arguments ? JSON.parse(tc.arguments || "{}") : {}
+                        }
+                    });
+
+                    // Create Tool Result Log (if completed)
+                    if (tc.status === 'completed' || tc.status === 'error') {
+                        newLogs.push({
+                            id: `log-${tc.id}-result`,
+                            timestamp: msg.timestamp, // In real backend, this would be later
+                            type: tc.status === 'error' ? 'error' : 'tool_result',
+                            content: tc.result || (tc.status === 'error' ? "Tool failed" : "Tool completed")
+                        });
+                    }
+                });
+            }
+
+            return {
+                nextState: SessionState.streaming,
+                contextUpdate: {
+                    logs: newLogs
+                }
+            }
+        }
 
         default:
             return { nextState: SessionState.streaming }

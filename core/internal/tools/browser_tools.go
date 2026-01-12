@@ -61,6 +61,12 @@ func (e *NativeExecutor) BrowserClick(ctx context.Context, args json.RawMessage)
 		return "", fmt.Errorf("invalid arguments: %w", err)
 	}
 
+	// INTERACTIVE CONSENT
+	desc := fmt.Sprintf("Click element '%s' on %s", payload.Selector, payload.URL)
+	if err := e.ensureConsent(ctx, "browser_click", payload.URL, desc); err != nil {
+		return "", err
+	}
+
 	if err := e.browser.Click(ctx, payload.URL, payload.Selector); err != nil {
 		return "", fmt.Errorf("failed to click element: %w", err)
 	}
@@ -76,6 +82,12 @@ func (e *NativeExecutor) BrowserType(ctx context.Context, args json.RawMessage) 
 	}
 	if err := json.Unmarshal(args, &payload); err != nil {
 		return "", fmt.Errorf("invalid arguments: %w", err)
+	}
+
+	// INTERACTIVE CONSENT
+	desc := fmt.Sprintf("Type text into '%s' on %s", payload.Selector, payload.URL)
+	if err := e.ensureConsent(ctx, "browser_type", payload.URL, desc); err != nil {
+		return "", err
 	}
 
 	if err := e.browser.Type(ctx, payload.URL, payload.Selector, payload.Text); err != nil {

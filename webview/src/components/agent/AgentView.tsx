@@ -28,6 +28,9 @@ export function AgentView() {
                 case 'ask_completion_result':
                     send({ type: 'ask_completion_result' });
                     break;
+                case 'chat_update':
+                    send({ type: 'chat_update', message: (message.payload as any).message });
+                    break;
                 case 'process_error': // If backend sends error
                     // send({ type: 'process_error', error: message.payload.error });
                     break;

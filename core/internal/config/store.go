@@ -44,10 +44,12 @@ type Settings struct {
 }
 
 type ProviderSettings struct {
-	Provider string            `json:"provider"` // "anthropic", "openai", "openrouter"
-	Model    string            `json:"model"`
-	APIKey   string            `json:"api_key"`            // Legacy single key (backwards compat)
-	APIKeys  map[string]string `json:"api_keys,omitempty"` // Per-provider keys
+	Provider          string            `json:"provider"` // "anthropic", "openai", "openrouter"
+	Model             string            `json:"model"`
+	APIKey            string            `json:"api_key"`                      // Legacy single key (backwards compat)
+	APIKeys           map[string]string `json:"api_keys,omitempty"`           // Per-provider keys
+	EmbeddingProvider string            `json:"embedding_provider,omitempty"` // Separate provider for embeddings (e.g. openai)
+	EmbeddingModel    string            `json:"embedding_model,omitempty"`    // Model for embeddings
 }
 
 type LiveModeSettings struct {
@@ -86,6 +88,14 @@ func NewStore() (*Store, error) {
 	} else if envKey := os.Getenv("RICOCHET_GEMINI_KEY"); envKey != "" {
 		defaultProvider = "gemini"
 		defaultModel = "gemini-3-flash"
+		defaultAPIKey = envKey
+	} else if envKey := os.Getenv("RICOCHET_MOONSHOT_KEY"); envKey != "" {
+		defaultProvider = "moonshot"
+		defaultModel = "moonshot-v1-8k"
+		defaultAPIKey = envKey
+	} else if envKey := os.Getenv("RICOCHET_ZHIPU_KEY"); envKey != "" {
+		defaultProvider = "zhipu"
+		defaultModel = "glm-4-flash"
 		defaultAPIKey = envKey
 	}
 
