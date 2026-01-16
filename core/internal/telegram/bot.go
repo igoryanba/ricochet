@@ -243,6 +243,19 @@ func (b *Bot) Start(ctx context.Context) {
 
 	log.Println("Telegram bot started successfully (lock acquired).")
 
+	// Set bot commands
+	_, err = b.bot.SetMyCommands(ctx, &bot.SetMyCommandsParams{
+		Commands: []models.BotCommand{
+			{Command: "start", Description: "🚀 Activate Ricochet"},
+			{Command: "new", Description: "🆕 New Session"},
+			{Command: "sessions", Description: "📚 List Sessions"},
+			{Command: "stop", Description: "🛑 Stop Live Mode"},
+		},
+	})
+	if err != nil {
+		log.Printf("⚠️ Failed to set bot commands: %v", err)
+	}
+
 	// Start the bot loop
 	b.bot.Start(ctx)
 
@@ -284,6 +297,23 @@ func (b *Bot) handleCallback(ctx context.Context, tgBot *bot.Bot, callback *mode
 	})
 
 	log.Printf("Callback received: %s from chat %d", callback.Data, chatID)
+
+	// Send confirmation message to user
+	var confirmMsg string
+	switch callback.Data {
+	case "yes":
+		confirmMsg = "✅ Approved. Executing..."
+	case "no":
+		confirmMsg = "❌ Rejected."
+	case "always allow":
+		confirmMsg = "🛡️ Always Allow enabled. Executing..."
+	default:
+		confirmMsg = "✓ Received: " + callback.Data
+	}
+	tgBot.SendMessage(ctx, &bot.SendMessageParams{
+		ChatID: chatID,
+		Text:   confirmMsg,
+	})
 
 	// Check if there's a pending promise for this chat
 	b.pendingMu.Lock()
@@ -376,11 +406,11 @@ func (b *Bot) handleVoice(ctx context.Context, tgBot *bot.Bot, message *models.M
 	}
 
 	if b.transcriber == nil {
-		b.SendMessage(ctx, chatID, "⚠️ Голосовое управление не настроено (отсутствует Transcriber).")
+		b.SendMessage(ctx, chatID, "⚠️ Voice control not configured (Transcriber missing).")
 		return
 	}
 
-	b.SendMessage(ctx, chatID, "🎙 _Обрабатываю голосовое сообщение..._")
+	b.SendMessage(ctx, chatID, "🎙 _Processing voice message..._")
 	b.SendTyping(ctx, chatID)
 
 	// 1. Get file info
@@ -388,7 +418,7 @@ func (b *Bot) handleVoice(ctx context.Context, tgBot *bot.Bot, message *models.M
 		FileID: message.Voice.FileID,
 	})
 	if err != nil {
-		b.SendMessage(ctx, chatID, fmt.Sprintf("❌ Ошибка при получении файла: %v", err))
+		b.SendMessage(ctx, chatID, fmt.Sprintf("❌ Error getting file: %v", err))
 		return
 	}
 
@@ -399,7 +429,7 @@ func (b *Bot) handleVoice(ctx context.Context, tgBot *bot.Bot, message *models.M
 	os.MkdirAll(filepath.Dir(oggPath), 0755)
 
 	if err := b.downloadFile(ctx, file.FilePath, oggPath); err != nil {
-		b.SendMessage(ctx, chatID, fmt.Sprintf("❌ Ошибка при скачивании файла: %v", err))
+		b.SendMessage(ctx, chatID, fmt.Sprintf("❌ Error downloading file: %v", err))
 		return
 	}
 	defer os.Remove(oggPath)
@@ -407,16 +437,16 @@ func (b *Bot) handleVoice(ctx context.Context, tgBot *bot.Bot, message *models.M
 	// 3. Transcribe
 	text, err := b.transcriber.Transcribe(oggPath)
 	if err != nil {
-		b.SendMessage(ctx, chatID, fmt.Sprintf("❌ Ошибка транскрипции: %v", err))
+		b.SendMessage(ctx, chatID, fmt.Sprintf("❌ Transcription error: %v", err))
 		return
 	}
 
 	if text == "" {
-		b.SendMessage(ctx, chatID, "🤔 Не удалось распознать речь.")
+		b.SendMessage(ctx, chatID, "🤔 Could not recognize speech.")
 		return
 	}
 
-	b.SendMessage(ctx, chatID, fmt.Sprintf("📝 _Текст_: %s", text))
+	b.SendMessage(ctx, chatID, fmt.Sprintf("📝 _Text_: %s", text))
 
 	// 4. Route to session
 	b.activeMu.Lock()
@@ -576,20 +606,54 @@ func (b *Bot) sendWelcomeMenu(ctx context.Context, chatID int64) {
 	keyboard := &models.InlineKeyboardMarkup{
 		InlineKeyboard: [][]models.InlineKeyboardButton{
 			{
-				{Text: "📋 История чатов", CallbackData: CallbackChatHistory},
-				{Text: "➕ Новый чат", CallbackData: CallbackNewChat},
+				{Text: "📋 Chat History", CallbackData: CallbackChatHistory},
+				{Text: "➕ New Chat", CallbackData: CallbackNewChat},
 			},
 		},
 	}
 
 	_, err := b.bot.SendMessage(ctx, &bot.SendMessageParams{
 		ChatID:      chatID,
-		Text:        "👋 Добро пожаловать в Ricochet!\n\nВыберите действие:",
+		Text:        "👋 **Welcome to Ricochet!**\n\nYour IDE is connected. Select an action:",
 		ReplyMarkup: keyboard,
 	})
 	if err != nil {
 		log.Printf("Failed to send welcome menu: %v", err)
 	}
+}
+
+// SessionView represents a session for display
+type SessionView struct {
+	ID        string
+	TotalCost float64
+}
+
+// SendSessionList sends a list of sessions
+func (b *Bot) SendSessionList(ctx context.Context, chatID int64, sessions []SessionView) error {
+	var buttons [][]models.InlineKeyboardButton
+
+	for i := len(sessions) - 1; i >= 0; i-- { // Reverse order (newest first assuming appended)
+		s := sessions[i]
+		label := fmt.Sprintf("📂 %s", s.ID)
+		if s.TotalCost > 0 {
+			label += fmt.Sprintf(" ($%.2f)", s.TotalCost)
+		}
+		buttons = append(buttons, []models.InlineKeyboardButton{
+			{Text: label, CallbackData: "session:" + s.ID},
+		})
+	}
+
+	buttons = append(buttons, []models.InlineKeyboardButton{
+		{Text: "➕ Start New Session", CallbackData: CallbackNewChat},
+	})
+
+	_, err := b.bot.SendMessage(ctx, &bot.SendMessageParams{
+		ChatID:      chatID,
+		Text:        "📚 **Select a Session:**",
+		ReplyMarkup: &models.InlineKeyboardMarkup{InlineKeyboard: buttons},
+		ParseMode:   models.ParseModeMarkdown,
+	})
+	return err
 }
 
 func (b *Bot) SendMessage(ctx context.Context, chatID int64, text string) error {

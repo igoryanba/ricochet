@@ -36,7 +36,7 @@ func main() {
 
 	// Create Executor
 	fmt.Println("Creating Executor...")
-	exec := tools.NewNativeExecutor(h, m, sg, nil, &index.Indexer{}, &codegraph.Service{})
+	exec := tools.NewNativeExecutor(h, m, sg, nil, &index.Indexer{}, &codegraph.Service{}, nil)
 	fmt.Println("Executor Created.")
 
 	// Bypass consent by adding permission rule

@@ -4,7 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"regexp"
+	"strings"
 )
+
+// Pattern to detect sed/awk commands that modify files
+var fileModifyPattern = regexp.MustCompile(`(?i)^(sed|awk|perl)\s+.*[>|]\s*\S+\.`)
 
 func (e *NativeExecutor) ExecuteCommand(ctx context.Context, args json.RawMessage) (string, error) {
 	var payload struct {
@@ -13,6 +18,13 @@ func (e *NativeExecutor) ExecuteCommand(ctx context.Context, args json.RawMessag
 	}
 	if err := json.Unmarshal(args, &payload); err != nil {
 		return "", fmt.Errorf("invalid arguments: %w", err)
+	}
+
+	// Check for file modification commands (sed, awk) - redirect to replace_file_content
+	cmd := strings.TrimSpace(payload.Command)
+	if fileModifyPattern.MatchString(cmd) ||
+		(strings.HasPrefix(cmd, "sed") && (strings.Contains(cmd, ">") || strings.Contains(cmd, "-i"))) {
+		return "", fmt.Errorf("❌ DO NOT use sed/awk to modify files. Use 'replace_file_content' tool instead. This ensures proper diff visualization, checkpoints, and undo capability")
 	}
 
 	// INTERACTIVE CONSENT (Phase 11)

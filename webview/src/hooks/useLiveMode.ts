@@ -58,6 +58,11 @@ export function useLiveMode() {
         return () => { unsubscribe(); };
     }, [onMessage]);
 
+    // Initial status fetch
+    useEffect(() => {
+        postMessage({ type: 'get_live_mode_status' });
+    }, [postMessage]);
+
     const toggleLiveMode = useCallback(async () => {
         setIsLoading(true);
         postMessage({ type: 'toggle_live_mode' });

@@ -185,6 +185,7 @@ func (pm *ProvidersManager) GetAvailableProviders() []AvailableProvider {
 		"openai":    "OpenAI",
 		"xai":       "xAI (Grok)",
 		"minimax":   "MiniMax",
+		"mistral":   "Mistral AI",
 	}
 
 	for id, p := range pm.config.Providers {
@@ -295,6 +296,15 @@ func (pm *ProvidersManager) defaultConfig() *ProvidersConfig {
 				Key:     os.Getenv("OPENAI_API_KEY"),
 				Models: []ModelConfig{
 					{ID: "gpt-4o", Name: "GPT-4o", ContextWindow: 128000, InputPrice: 2.5, OutputPrice: 10.0, SupportsTools: true},
+				},
+			},
+			"mistral": {
+				Enabled: true,
+				Key:     os.Getenv("MISTRAL_API_KEY"),
+				BaseURL: "https://api.mistral.ai/v1",
+				Models: []ModelConfig{
+					{ID: "codestral-latest", Name: "Codestral (Free)", ContextWindow: 32000, IsFree: true, SupportsTools: true},
+					{ID: "ministral-8b-latest", Name: "Ministral 8B (Free)", ContextWindow: 128000, IsFree: true, SupportsTools: true},
 				},
 			},
 		},

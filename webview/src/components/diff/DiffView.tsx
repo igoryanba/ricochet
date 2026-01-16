@@ -1,13 +1,13 @@
 import { useState, useMemo } from 'react';
 import { Check, X, ChevronDown, ChevronUp, Plus, Minus, Edit, FileEdit } from 'lucide-react';
 
-interface DiffLine {
+export interface DiffLine {
     type: 'add' | 'remove' | 'context';
     content: string;
     lineNumber?: number;
 }
 
-interface FileDiff {
+export interface FileDiff {
     path: string;
     operation: 'create' | 'modify' | 'delete';
     hunks: DiffLine[][];
@@ -15,8 +15,8 @@ interface FileDiff {
 
 interface DiffViewProps {
     diffs: FileDiff[];
-    onApprove: () => void;
-    onReject: () => void;
+    onApprove?: () => void;
+    onReject?: () => void;
     onViewInVSCode?: (path: string) => void;
     isLoading?: boolean;
 }
@@ -68,22 +68,26 @@ export function DiffView({ diffs, onApprove, onReject, onViewInVSCode, isLoading
                     </div>
                 </div>
                 <div className="flex items-center gap-1">
-                    <button
-                        onClick={onReject}
-                        disabled={isLoading}
-                        className="flex items-center gap-1 px-2 py-1 text-xs bg-red-500/20 text-red-400 hover:bg-red-500/30 rounded transition-colors disabled:opacity-50"
-                    >
-                        <X className="w-3 h-3" />
-                        Reject
-                    </button>
-                    <button
-                        onClick={onApprove}
-                        disabled={isLoading}
-                        className="flex items-center gap-1 px-2 py-1 text-xs bg-green-500/20 text-green-400 hover:bg-green-500/30 rounded transition-colors disabled:opacity-50"
-                    >
-                        <Check className="w-3 h-3" />
-                        Apply
-                    </button>
+                    {onReject && (
+                        <button
+                            onClick={onReject}
+                            disabled={isLoading}
+                            className="flex items-center gap-1 px-2 py-1 text-xs bg-red-500/20 text-red-400 hover:bg-red-500/30 rounded transition-colors disabled:opacity-50"
+                        >
+                            <X className="w-3 h-3" />
+                            Reject
+                        </button>
+                    )}
+                    {onApprove && (
+                        <button
+                            onClick={onApprove}
+                            disabled={isLoading}
+                            className="flex items-center gap-1 px-2 py-1 text-xs bg-green-500/20 text-green-400 hover:bg-green-500/30 rounded transition-colors disabled:opacity-50"
+                        >
+                            <Check className="w-3 h-3" />
+                            Apply
+                        </button>
+                    )}
                 </div>
             </div>
 

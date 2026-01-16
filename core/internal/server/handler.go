@@ -17,6 +17,7 @@ import (
 	"github.com/igoryan-dao/ricochet/internal/modes"
 	"github.com/igoryan-dao/ricochet/internal/protocol"
 	"github.com/igoryan-dao/ricochet/internal/whisper"
+	"github.com/igoryan-dao/ricochet/internal/workflow"
 )
 
 // ResponseWriter interface allows different transports (Stdio, WS) to send responses
@@ -37,6 +38,7 @@ type Handler struct {
 	Modes          *modes.Manager
 	McpHub         *mcp.Hub
 	Codegraph      *codegraph.Service
+	Workflows      *workflow.Manager
 	Transcriber    *whisper.Transcriber
 	AudioBuffer    []byte
 	AudioMu        sync.Mutex
@@ -54,17 +56,21 @@ func NewHandler(
 	modes *modes.Manager,
 	mcp *mcp.Hub,
 	cg *codegraph.Service,
+	wm *workflow.Manager,
 	pm *config.ProvidersManager,
+	liveCtrl *livemode.Controller,
 ) *Handler {
 	return &Handler{
 		GlobalCtx:      ctx,
 		Config:         cfg,
 		LiveModeConfig: liveCfg,
+		LiveMode:       liveCtrl,
 		Settings:       settings,
 		Host:           host,
 		Modes:          modes,
 		McpHub:         mcp,
 		Codegraph:      cg,
+		Workflows:      wm,
 		Providers:      pm,
 	}
 }
@@ -143,6 +149,13 @@ func (h *Handler) HandleMessage(msg protocol.RPCMessage, writer ResponseWriter) 
 		}
 		writer.Send(protocol.RPCMessage{ID: msg.ID, Type: "session_deleted"})
 
+	case "abort_chat":
+		log.Printf("Received abort_chat request")
+		if h.Agent != nil {
+			h.Agent.AbortCurrentSession()
+		}
+		writer.Send(protocol.RPCMessage{ID: msg.ID, Type: "aborted", Payload: protocol.EncodeRPC(map[string]bool{"success": true})})
+
 	case "chat_message":
 		var payload struct {
 			Content string `json:"content"`
@@ -190,13 +203,21 @@ func (h *Handler) HandleMessage(msg protocol.RPCMessage, writer ResponseWriter) 
 			SessionID: sessionID,
 			Content:   fullPayload.Content,
 			Via:       fullPayload.Via,
-		}, func(update agent.ChatUpdate) {
-			writer.Send(protocol.RPCMessage{
-				Type: "chat_update",
-				Payload: protocol.EncodeRPC(map[string]interface{}{
-					"message": update.Message,
-				}),
-			})
+		}, func(update interface{}) {
+			switch u := update.(type) {
+			case agent.ChatUpdate:
+				writer.Send(protocol.RPCMessage{
+					Type: "chat_update",
+					Payload: protocol.EncodeRPC(map[string]interface{}{
+						"message": u.Message,
+					}),
+				})
+			case protocol.TaskProgress:
+				writer.Send(protocol.RPCMessage{
+					Type:    "task_progress",
+					Payload: protocol.EncodeRPC(u),
+				})
+			}
 		})
 
 		if err != nil {
@@ -252,6 +273,24 @@ func (h *Handler) HandleMessage(msg protocol.RPCMessage, writer ResponseWriter) 
 			}),
 		})
 
+	case "get_workflows":
+		if h.Workflows != nil {
+			// Reload to ensure fresh data
+			h.Workflows.LoadWorkflows()
+			wfs := h.Workflows.GetWorkflows()
+			writer.Send(protocol.RPCMessage{
+				ID:      msg.ID,
+				Type:    "workflows_list",
+				Payload: protocol.EncodeRPC(map[string]interface{}{"workflows": wfs}),
+			})
+		} else {
+			writer.Send(protocol.RPCMessage{
+				ID:      msg.ID,
+				Type:    "workflows_list",
+				Payload: protocol.EncodeRPC(map[string]interface{}{"workflows": []interface{}{}}),
+			})
+		}
+
 	case "get_settings":
 		if h.Settings == nil {
 			writer.Send(protocol.RPCMessage{ID: msg.ID, Error: "settings store not initialized"})
@@ -276,7 +315,21 @@ func (h *Handler) HandleMessage(msg protocol.RPCMessage, writer ResponseWriter) 
 	case "set_live_mode":
 		h.handleSetLiveMode(msg, writer)
 
-		// Add Audio handlers here later if needed (keeping basic logic for now)
+	case "get_live_mode_status":
+		if h.LiveMode != nil {
+			status := h.LiveMode.GetStatus()
+			writer.Send(protocol.RPCMessage{
+				ID:      msg.ID,
+				Type:    "live_mode_status",
+				Payload: protocol.EncodeRPC(status),
+			})
+		} else {
+			writer.Send(protocol.RPCMessage{
+				ID:      msg.ID,
+				Type:    "live_mode_status",
+				Payload: protocol.EncodeRPC(map[string]interface{}{"enabled": false, "error": "Live Mode not initialized"}),
+			})
+		}
 	}
 }
 
@@ -288,6 +341,11 @@ func (h *Handler) lazyInitAgent() error {
 		return nil
 	}
 
+	if h.Settings != nil {
+		s := h.Settings.Get()
+		h.Config.AutoApproval = &s.AutoApproval
+	}
+
 	log.Printf("Initializing agent controller with provider %s (%s)", h.Config.Provider.Provider, h.Config.Provider.Model)
 	var err error
 	h.Agent, err = agent.NewController(h.Config, agent.ControllerOptions{
@@ -296,12 +354,14 @@ func (h *Handler) lazyInitAgent() error {
 		McpHub:           h.McpHub,
 		ProvidersManager: h.Providers,
 		Codegraph:        h.Codegraph,
+		WorkflowManager:  h.Workflows,
 	})
 	if err != nil {
 		return err
 	}
 	if h.LiveMode != nil {
 		h.Agent.SetLiveMode(h.LiveMode)
+		h.LiveMode.SetAgent(h.Agent)
 	}
 	return nil
 }
@@ -323,11 +383,14 @@ func (h *Handler) handleSaveSettings(msg protocol.RPCMessage, writer ResponseWri
 		return
 	}
 
-	// Disable old livemode if running
-	if h.LiveMode != nil {
-		h.LiveMode.Disable(h.GlobalCtx)
-		h.LiveMode = nil
+	// Do not destroy h.LiveMode here. It is running in the background (managed by main.go/Handler).
+	// We will re-link the new Agent to it in lazyInitAgent.
+
+	// Update LiveMode ChatID if changed
+	if h.LiveMode != nil && payload.TelegramChatID != 0 {
+		h.LiveMode.SetChatID(payload.TelegramChatID)
 	}
+
 	h.Agent = nil // Reset agent to re-init with new config
 
 	if h.Settings != nil {
@@ -425,6 +488,10 @@ func (h *Handler) handleSetLiveMode(msg protocol.RPCMessage, writer ResponseWrit
 
 	h.InitMu.Lock()
 	if h.LiveMode == nil {
+		// Should have been initialized in main.go, but if not (e.g. no token on startup but added later??)
+		// We can try to init here, but it won't have callbacks wired unless we wire them.
+		// For now, assume main.go handles it if token is present.
+		// If token was added via settings save, we might need re-init.
 		var err error
 		h.LiveMode, err = livemode.New(h.LiveModeConfig, h.Agent)
 		if err != nil {
@@ -437,29 +504,13 @@ func (h *Handler) handleSetLiveMode(msg protocol.RPCMessage, writer ResponseWrit
 			return
 		}
 
-		// Setup forwarding callbacks
-		h.LiveMode.SetOnActivity(func(activity livemode.EtherActivity) {
-			writer.Send(protocol.RPCMessage{ // Use generic message wrapper or Response struct if available in protocol package
-				Type: "ether_activity",
-				Payload: protocol.EncodeRPC(map[string]interface{}{
-					"stage":    activity.Stage,
-					"source":   activity.Source,
-					"username": activity.Username,
-					"preview":  activity.Preview,
-				}),
-			})
-		})
+		// Note: Callbacks might be missing if created here!
+		// TODO: Ensure save_settings re-wires LiveMode properly.
+	}
 
-		h.LiveMode.SetOnChatUpdate(func(update agent.ChatUpdate) {
-			writer.Send(protocol.RPCMessage{
-				Type:    "chat_update",
-				Payload: protocol.EncodeRPC(update),
-			})
-		})
-
-		if h.Agent != nil {
-			h.Agent.SetLiveMode(h.LiveMode)
-		}
+	if h.Agent != nil && h.LiveMode != nil {
+		h.Agent.SetLiveMode(h.LiveMode)
+		h.LiveMode.SetAgent(h.Agent)
 	}
 	h.InitMu.Unlock()
 

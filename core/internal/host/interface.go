@@ -24,6 +24,7 @@ type Host interface {
 	ShowMessage(level string, text string)
 	AskUser(question string) (string, error)
 	SendMessage(msg protocol.RPCMessage)
+	SendRequest(method string, payload interface{}) (interface{}, error)
 }
 
 // CommandStatus represents the current state of a command

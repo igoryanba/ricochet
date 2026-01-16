@@ -37,6 +37,7 @@ export class AgentService {
                 await this.startSession(message.payload);
                 break;
             case 'cancel_session':
+            case 'cancel_generation': // Alias from webview
                 await this.cancelSession();
                 break;
         }
@@ -171,7 +172,9 @@ export class AgentService {
 
     private async cancelSession() {
         if (this.activeSessionId) {
-            // Maybe send a 'stop' signal to Core if supported
+            console.log('[AgentService] Cancelling session:', this.activeSessionId);
+            // Send abort signal to Core
+            await this.core.send('abort_chat', { session_id: this.activeSessionId });
             this.activeSessionId = null;
         }
     }

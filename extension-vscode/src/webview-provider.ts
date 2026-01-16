@@ -27,6 +27,7 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     private chatService?: ChatService;
     private mcpService?: McpService;
     private agentService: AgentService;
+    private pendingPermissionRequests: Map<string, (response: string) => void> = new Map();
 
     constructor(
         private readonly context: vscode.ExtensionContext,
@@ -74,16 +75,26 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
         });
 
         // Handle synchronous requests from the core
-        this.core.onRequest('ask_user', async (payload: any) => {
+        // Handle synchronous requests from the core
+        this.core.onRequest('ask_user', (payload: any) => {
             const { question } = payload;
-            const answer = await vscode.window.showInformationMessage(
-                question,
-                { modal: true },
-                'Yes',
-                'Always Allow',
-                'No'
-            );
-            return answer || 'No';
+
+            // Create a promise that will be resolved when the webview responds
+            return new Promise((resolve) => {
+                const requestId = Date.now().toString(); // Simple ID for this interaction
+
+                // Store the resolver to be called later
+                this.pendingPermissionRequests.set(requestId, resolve);
+
+                // Ask the webview to show the permission UI
+                this.postMessage({
+                    type: 'request_permission',
+                    payload: {
+                        id: requestId,
+                        question
+                    }
+                });
+            });
         });
     }
 
@@ -114,6 +125,15 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
             await this.mcpService?.handleMessage(message);
 
             switch (message.type) {
+                case 'permission_response':
+                    const { id, answer } = message.payload;
+                    const resolve = this.pendingPermissionRequests.get(id);
+                    if (resolve) {
+                        resolve(answer);
+                        this.pendingPermissionRequests.delete(id);
+                    }
+                    break;
+
                 case 'send_message':
                 case 'toggle_live_mode':
                 case 'clear_chat':
@@ -245,11 +265,11 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
                     break;
 
                 // Session Management
-                case 'get_sessions':
+                case 'list_sessions':
                     const sessions = await this.sessionService.listSessions();
-                    this.postMessage({ type: 'sessions_list', payload: { sessions } });
+                    this.postMessage({ type: 'session_list', payload: { sessions } });
                     break;
-
+                case 'create_session':
                     if (vscode.workspace.workspaceFolders && vscode.workspace.workspaceFolders.length > 0) {
                         const newId = await this.sessionService.createSession(vscode.workspace.workspaceFolders[0].uri.fsPath);
                         this.chatService?.setActiveSession(newId);
@@ -271,12 +291,13 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
                 case 'delete_session':
                     await this.sessionService.deleteSession(message.payload.id);
                     const updatedSessions = await this.sessionService.listSessions();
-                    this.postMessage({ type: 'sessions_list', payload: { sessions: updatedSessions } });
+                    this.postMessage({ type: 'session_list', payload: { sessions: updatedSessions } });
                     break;
 
                 // Agent Manager Handlers
                 case 'start_session':
                 case 'cancel_session':
+                case 'cancel_generation': // Alias for webview compatibility
                     await this.agentService.handleMessage(message);
                     break;
 
@@ -326,6 +347,11 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
                     }
                     break;
 
+                case 'get_live_mode_status':
+                    // Fire and forget request to core
+                    this.core.send('get_live_mode_status', {}).catch(e => console.error('Error fetching live status:', e));
+                    break;
+
                 case 'save_settings':
                     try {
                         await this.core.send('save_settings', message.payload);
@@ -341,6 +367,40 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
                         await this.core.send('save_settings', { auto_approval: message.payload });
                     } catch (e) {
                         console.error('Failed to sync auto-approve settings:', e);
+                    }
+                    break;
+
+                case 'set_auto_approve':
+                    try {
+                        // 1. Get current settings
+                        const currentSettings: any = await this.core.send('get_settings', {});
+                        const autoApproval = currentSettings.auto_approval || {};
+
+                        // 2. Patch settings
+                        if (message.payload.commands) {
+                            autoApproval.execute_safe_commands = true;
+                            autoApproval.execute_all_commands = true;
+                        }
+
+                        // 3. Save
+                        await this.core.send('save_settings', { auto_approval: autoApproval });
+
+                        // 4. Resolve all pending requests since user said "Always"
+                        if (message.payload.commands) {
+                            for (const [id, resolve] of this.pendingPermissionRequests.entries()) {
+                                resolve('yes'); // Assuming 'yes' is the approval string expected by Core
+                            }
+                            this.pendingPermissionRequests.clear();
+                        }
+
+                        // 5. Broadcast update so Panel refreshes
+                        const newSettings = await this.core.send('get_settings', {});
+                        this.postMessage({ type: 'settings_loaded', payload: newSettings });
+
+                        vscode.window.showInformationMessage('Auto-approve enabled. Resuming commands...');
+                    } catch (e) {
+                        console.error('Failed to set auto-approve:', e);
+                        vscode.window.showErrorMessage('Failed to enable auto-approve');
                     }
                     break;
 

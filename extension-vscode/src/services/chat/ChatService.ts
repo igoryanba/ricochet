@@ -9,6 +9,11 @@ export class ChatService {
     private diffService: DiffService;
     private activeSessionId: string | null = null;
 
+    // Throttling for chat updates to prevent webview crash
+    private pendingChatUpdate: any = null;
+    private chatUpdateTimer: ReturnType<typeof setTimeout> | null = null;
+    private readonly THROTTLE_MS = 300; // ~3 updates per second - aggressive rate limiting for stability
+
     constructor(
         private readonly core: CoreProcess,
         private readonly postMessage: (msg: any) => void,
@@ -24,6 +29,15 @@ export class ChatService {
     public async handleMessage(message: any): Promise<void> {
         switch (message.type) {
             case 'send_message':
+                // Auto-create session if none exists
+                if (!this.activeSessionId) {
+                    const workspaces = vscode.workspace.workspaceFolders;
+                    if (workspaces && workspaces.length > 0) {
+                        this.activeSessionId = await this.sessionService.createSession(workspaces[0].uri.fsPath);
+                        console.log('[ChatService] Auto-created session:', this.activeSessionId);
+                    }
+                }
+
                 // Save user message to session
                 if (this.activeSessionId) {
                     await this.sessionService.appendMessage(this.activeSessionId, {
@@ -83,18 +97,48 @@ export class ChatService {
     }
 
     public async onChatUpdate(payload: any): Promise<void> {
-        // payload: { message: { role: 'assistant', content: '...', ... } }
-        this.postMessage({ type: 'chat_update', payload });
+        const isFinalMessage = payload.message?.isStreaming === false || payload.done === true;
 
-        if (this.activeSessionId && payload.message && !payload.message.partial) {
-            // If `isStreaming` is false, it might be the final block
-            if (payload.message.isStreaming === false || payload.done === true) {
+        // Final messages bypass throttle and flush immediately
+        if (isFinalMessage) {
+            this.flushPendingUpdate();
+            this.postMessage({ type: 'chat_update', payload });
+
+            // Save to session
+            if (this.activeSessionId && payload.message && !payload.message.partial) {
                 await this.sessionService.appendMessage(this.activeSessionId, {
                     role: 'assistant',
                     content: payload.message.content,
                     timestamp: Date.now()
                 });
             }
+            return;
+        }
+
+        // Streaming updates are throttled
+        this.pendingChatUpdate = payload;
+
+        if (!this.chatUpdateTimer) {
+            // Send first update immediately, then throttle subsequent ones
+            this.postMessage({ type: 'chat_update', payload });
+            this.chatUpdateTimer = setTimeout(() => {
+                this.chatUpdateTimer = null;
+                if (this.pendingChatUpdate) {
+                    this.postMessage({ type: 'chat_update', payload: this.pendingChatUpdate });
+                    this.pendingChatUpdate = null;
+                }
+            }, this.THROTTLE_MS);
+        }
+    }
+
+    private flushPendingUpdate(): void {
+        if (this.chatUpdateTimer) {
+            clearTimeout(this.chatUpdateTimer);
+            this.chatUpdateTimer = null;
+        }
+        if (this.pendingChatUpdate) {
+            this.postMessage({ type: 'chat_update', payload: this.pendingChatUpdate });
+            this.pendingChatUpdate = null;
         }
     }
 

@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strings"
 
@@ -60,10 +61,11 @@ type openaiRequest struct {
 }
 
 type openaiMessage struct {
-	Role       string           `json:"role"`
-	Content    string           `json:"content"`
-	ToolCalls  []openaiToolCall `json:"tool_calls,omitempty"`
-	ToolCallID string           `json:"tool_call_id,omitempty"`
+	Role             string           `json:"role"`
+	Content          string           `json:"content"`
+	ReasoningContent string           `json:"reasoning_content,omitempty"` // DeepSeek R1
+	ToolCalls        []openaiToolCall `json:"tool_calls,omitempty"`
+	ToolCallID       string           `json:"tool_call_id,omitempty"`
 }
 
 type openaiToolCall struct {
@@ -269,9 +271,10 @@ func (p *OpenAIProvider) buildRequest(req *ChatRequest, stream bool) *openaiRequ
 				})
 			}
 			messages = append(messages, openaiMessage{
-				Role:      msg.Role,
-				Content:   msg.Content,
-				ToolCalls: toolCalls,
+				Role:             msg.Role,
+				Content:          msg.Content,
+				ReasoningContent: msg.ReasoningContent, // DeepSeek R1 requires this for tool calls
+				ToolCalls:        toolCalls,
 			})
 			continue
 		}
@@ -355,9 +358,10 @@ type openaiStreamChunk struct {
 	Choices []struct {
 		Index int `json:"index"`
 		Delta struct {
-			Role      string                 `json:"role,omitempty"`
-			Content   string                 `json:"content,omitempty"`
-			ToolCalls []openaiStreamToolCall `json:"tool_calls,omitempty"`
+			Role             string                 `json:"role,omitempty"`
+			Content          string                 `json:"content,omitempty"`
+			ReasoningContent string                 `json:"reasoning_content,omitempty"`
+			ToolCalls        []openaiStreamToolCall `json:"tool_calls,omitempty"`
 		} `json:"delta"`
 		FinishReason string `json:"finish_reason"`
 	} `json:"choices"`
@@ -383,6 +387,8 @@ func (p *OpenAIProvider) processStream(reader io.Reader, callback StreamCallback
 		args strings.Builder
 	})
 
+	var inReasoning bool
+
 	for scanner.Scan() {
 		line := scanner.Text()
 
@@ -396,6 +402,14 @@ func (p *OpenAIProvider) processStream(reader io.Reader, callback StreamCallback
 
 		data := strings.TrimPrefix(line, "data: ")
 		if data == "[DONE]" {
+			// Close reasoning if still open
+			if inReasoning {
+				callback(&StreamChunk{
+					Type:  "content_block_delta",
+					Delta: "\n</thinking>\n\n",
+				})
+				inReasoning = false
+			}
 			callback(&StreamChunk{Type: "message_stop"})
 			break
 		}
@@ -411,8 +425,33 @@ func (p *OpenAIProvider) processStream(reader io.Reader, callback StreamCallback
 
 		choice := chunk.Choices[0]
 
+		// Handle reasoning delta (DeepSeek R1/V3)
+		if choice.Delta.ReasoningContent != "" {
+			if !inReasoning {
+				log.Printf("[OpenAI] Starting reasoning block, first chunk: %q", choice.Delta.ReasoningContent[:min(50, len(choice.Delta.ReasoningContent))])
+				callback(&StreamChunk{
+					Type:  "content_block_delta",
+					Delta: "<thinking>\n",
+				})
+				inReasoning = true
+			}
+			// Send both: Delta for UI display, ReasoningDelta for storage
+			callback(&StreamChunk{
+				Type:           "content_block_delta",
+				Delta:          choice.Delta.ReasoningContent,
+				ReasoningDelta: choice.Delta.ReasoningContent,
+			})
+		}
+
 		// Handle content delta
 		if choice.Delta.Content != "" {
+			if inReasoning {
+				callback(&StreamChunk{
+					Type:  "content_block_delta",
+					Delta: "\n</thinking>\n\n",
+				})
+				inReasoning = false
+			}
 			callback(&StreamChunk{
 				Type:  "content_block_delta",
 				Delta: choice.Delta.Content,
@@ -421,6 +460,14 @@ func (p *OpenAIProvider) processStream(reader io.Reader, callback StreamCallback
 
 		// Handle tool calls
 		for _, tc := range choice.Delta.ToolCalls {
+			if inReasoning {
+				callback(&StreamChunk{
+					Type:  "content_block_delta",
+					Delta: "\n</thinking>\n\n",
+				})
+				inReasoning = false
+			}
+
 			if _, ok := toolCallBuffers[tc.Index]; !ok {
 				toolCallBuffers[tc.Index] = &struct {
 					id   string
@@ -446,6 +493,14 @@ func (p *OpenAIProvider) processStream(reader io.Reader, callback StreamCallback
 
 		// Handle finish reason
 		if choice.FinishReason != "" {
+			if inReasoning {
+				callback(&StreamChunk{
+					Type:  "content_block_delta",
+					Delta: "\n</thinking>\n\n",
+				})
+				inReasoning = false
+			}
+
 			// Emit any buffered tool calls
 			for _, buf := range toolCallBuffers {
 				callback(&StreamChunk{

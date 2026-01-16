@@ -24,6 +24,7 @@ import (
 	"github.com/igoryan-dao/ricochet/internal/prompts"
 	"github.com/igoryan-dao/ricochet/internal/protocol"
 	"github.com/igoryan-dao/ricochet/internal/server"
+	"github.com/igoryan-dao/ricochet/internal/workflow"
 )
 
 var (
@@ -226,6 +227,23 @@ func runStdioMode(ctx context.Context, cwd string) {
 	modesManager := modes.NewManager(cwd)
 	mcpHub := mcp.NewHub(cwd)
 	cg := codegraph.NewService()
+	// Init Workflow Manager
+	wm := workflow.NewManager(cwd)
+	if err := wm.LoadWorkflows(); err != nil {
+		log.Printf("Warning: Failed to load workflows: %v", err)
+	}
+	if err := wm.Hooks.LoadHooks(); err != nil {
+		log.Printf("Warning: Failed to load hooks: %v", err)
+	}
+
+	// Trigger on_start hook
+	wm.Hooks.Trigger("on_start")
+
+	// Handle graceful shutdown for hooks
+	go func() {
+		<-ctx.Done()
+		wm.Hooks.Trigger("on_shutdown")
+	}()
 
 	modesManager.SetOnModeChange(func(slug string) {
 		sendMessage(protocol.RPCMessage{
@@ -233,6 +251,45 @@ func runStdioMode(ctx context.Context, cwd string) {
 			Payload: protocol.EncodeRPC(map[string]string{"mode": slug}),
 		})
 	})
+
+	// Initialize LiveMode Controller
+	var liveCtrl *livemode.Controller
+	if liveModeConfig.TelegramToken != "" {
+		var err error
+		liveCtrl, err = livemode.New(liveModeConfig, nil)
+		if err != nil {
+			log.Printf("Warning: Failed to create LiveMode controller: %v", err)
+		} else {
+			// Wire callbacks
+			liveCtrl.SetOnStatusUpdate(func(status livemode.Status) {
+				sendMessage(protocol.RPCMessage{
+					Type:    "live_mode_status",
+					Payload: protocol.EncodeRPC(status),
+				})
+			})
+			liveCtrl.SetOnActivity(func(activity livemode.EtherActivity) {
+				sendMessage(protocol.RPCMessage{
+					Type: "ether_activity",
+					Payload: protocol.EncodeRPC(map[string]interface{}{
+						"stage":    activity.Stage,
+						"source":   activity.Source,
+						"username": activity.Username,
+						"preview":  activity.Preview,
+					}),
+				})
+			})
+			liveCtrl.SetOnChatUpdate(func(update agent.ChatUpdate) {
+				sendMessage(protocol.RPCMessage{
+					Type: "chat_update",
+					Payload: protocol.EncodeRPC(map[string]interface{}{
+						"message": update.Message,
+					}),
+				})
+			})
+			// Start background polling
+			liveCtrl.Start(ctx)
+		}
+	}
 
 	// Initialize Handler
 	// We pass nil for ProvidersManager initially, Handler handles lazy load if needed
@@ -245,7 +302,9 @@ func runStdioMode(ctx context.Context, cwd string) {
 		modesManager,
 		mcpHub,
 		cg,
+		wm,
 		nil,
+		liveCtrl,
 	)
 	writer := &StdioWriter{}
 
@@ -273,11 +332,6 @@ func runStdioMode(ctx context.Context, cwd string) {
 
 		// Handle response type directly in loop (Host specific)
 		if msg.Type == "response" {
-			var payload string
-			// For RawMessage, we just pass the raw bytes or unmarshal if needed
-			// Let's assume HandleResponse takes string for now as it's for AskUser
-			_ = json.Unmarshal(msg.Payload, &payload)
-
 			// Handle ID which could be string or float64 from extension
 			var idStr string
 			switch v := msg.ID.(type) {
@@ -285,9 +339,13 @@ func runStdioMode(ctx context.Context, cwd string) {
 				idStr = v
 			case float64:
 				idStr = fmt.Sprintf("%.0f", v)
+			default:
+				log.Printf("Warning: Unknown ID type: %T", v)
+				continue
 			}
 
-			stdioHost.HandleResponse(idStr, payload)
+			// Pass raw payload directly to handle generic types
+			stdioHost.HandleResponse(idStr, msg.Payload)
 			continue
 		}
 
@@ -312,9 +370,52 @@ func runServerMode(ctx context.Context, cwd, port string) {
 	modesManager := modes.NewManager(cwd)
 	mcpHub := mcp.NewHub(cwd)
 	cg := codegraph.NewService()
+	wm := workflow.NewManager(cwd)
+	wm.LoadWorkflows()
 
 	wsHub = NewWsHub()
 	go wsHub.Run(ctx)
+
+	// Initialize LiveMode Controller
+	var liveCtrl *livemode.Controller
+	if liveModeConfig.TelegramToken != "" {
+		var err error
+		liveCtrl, err = livemode.New(liveModeConfig, nil)
+		if err != nil {
+			log.Printf("Warning: Failed to create LiveMode controller: %v", err)
+		} else {
+			// Wire callbacks - using wsHub Broadcast
+			broadcastWriter := &BroadcastWriter{hub: wsHub}
+
+			liveCtrl.SetOnStatusUpdate(func(status livemode.Status) {
+				broadcastWriter.Send(protocol.RPCMessage{
+					Type:    "live_mode_status",
+					Payload: protocol.EncodeRPC(status),
+				})
+			})
+			liveCtrl.SetOnActivity(func(activity livemode.EtherActivity) {
+				broadcastWriter.Send(protocol.RPCMessage{
+					Type: "ether_activity",
+					Payload: protocol.EncodeRPC(map[string]interface{}{
+						"stage":    activity.Stage,
+						"source":   activity.Source,
+						"username": activity.Username,
+						"preview":  activity.Preview,
+					}),
+				})
+			})
+			liveCtrl.SetOnChatUpdate(func(update agent.ChatUpdate) {
+				broadcastWriter.Send(protocol.RPCMessage{
+					Type: "chat_update",
+					Payload: protocol.EncodeRPC(map[string]interface{}{
+						"message": update.Message,
+					}),
+				})
+			})
+			// Start background polling
+			liveCtrl.Start(ctx)
+		}
+	}
 
 	handler := server.NewHandler(
 		ctx,
@@ -325,7 +426,9 @@ func runServerMode(ctx context.Context, cwd, port string) {
 		modesManager,
 		mcpHub,
 		cg,
+		wm,
 		nil,
+		liveCtrl,
 	)
 
 	http.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {

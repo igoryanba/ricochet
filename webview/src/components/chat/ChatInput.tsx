@@ -1,6 +1,7 @@
 import { useRef, useEffect, KeyboardEvent, useState } from 'react';
 import { Send, Mic, Square, ChevronDown, FileCode, Plus, StopCircle } from 'lucide-react';
 import { useAudioRecorder } from '../../hooks/useAudioRecorder';
+import { useVSCodeApi } from '../../hooks/useVSCodeApi';
 import { FileSearchResult } from '../../hooks/useChat';
 import { ModelPickerModal } from './ModelPickerModal';
 import { EtherStatus } from './EtherPanel';
@@ -21,17 +22,12 @@ interface ChatInputProps {
     onToggleLiveMode?: () => void;
 }
 
-const MODES = [
-    { slug: 'code', name: 'Code' },
-    { slug: 'architect', name: 'Architect' },
-    { slug: 'ask', name: 'Ask' },
-    { slug: 'messenger', name: 'Messenger' },
-];
 
-// Default model, will be updated from settings
-const DEFAULT_MODEL = { id: 'gemini-3-flash', name: 'Gemini 3 Flash', provider: 'gemini' };
 
-const COMMANDS = [
+// Placeholder - will be replaced by first available model from providers
+const DEFAULT_MODEL = { id: '', name: 'Loading...', provider: '' };
+
+const DEFAULT_COMMANDS = [
     { command: '/clear', description: 'Clear chat history' },
     { command: '/reset', description: 'Reset session context' },
     { command: '/mode code', description: 'Switch to Code mode' },
@@ -63,8 +59,8 @@ export function ChatInput(props: ChatInputProps) {
         onCancel,
         isLoading = false,
         placeholder = 'Type your message...',
-        currentMode = 'code',
-        onModeChange,
+        // currentMode = 'code', // Unused
+        // onModeChange, // Unused
         // onOpenSettings, // Unused
         fileResults = [],
         searchFiles,
@@ -79,14 +75,14 @@ export function ChatInput(props: ChatInputProps) {
 
     const textareaRef = useRef<HTMLTextAreaElement>(null);
     const { isRecording, toggleRecording } = useAudioRecorder();
-    const [showModeMenu, setShowModeMenu] = useState(false);
+
     const [showModelMenu, setShowModelMenu] = useState(false);
     const [currentModel, setCurrentModel] = useState(DEFAULT_MODEL);
     const [images, setImages] = useState<string[]>([]); // Base64 strings
     const [isPlanMode, setIsPlanMode] = useState(false); // Plan/Act toggle
 
     const closeAllMenus = () => {
-        setShowModeMenu(false);
+        setShowModelMenu(false);
         setShowModelMenu(false);
         setShowFileMenu(false);
         setShowCommandMenu(false);
@@ -98,7 +94,74 @@ export function ChatInput(props: ChatInputProps) {
 
     // Slash Command State
     const [showCommandMenu, setShowCommandMenu] = useState(false);
-    const [filteredCommands, setFilteredCommands] = useState(COMMANDS);
+    const [filteredCommands, setFilteredCommands] = useState(DEFAULT_COMMANDS);
+    const [availableCommands, setAvailableCommands] = useState(DEFAULT_COMMANDS);
+    const { postMessage, onMessage } = useVSCodeApi();
+
+    // Fetch models on mount to get first available model
+    useEffect(() => {
+        postMessage({ type: 'get_models' });
+    }, [postMessage]);
+
+    // Listen for models response and set first available as current
+    useEffect(() => {
+        const unsubscribe = onMessage((msg: any) => {
+            if (msg.type === 'models' && currentModel.id === '') {
+                const providers = msg.payload?.providers || [];
+                // Find first provider with models
+                for (const provider of providers) {
+                    if (provider.models && provider.models.length > 0) {
+                        const firstModel = provider.models[0];
+                        setCurrentModel({
+                            id: firstModel.id,
+                            name: firstModel.name,
+                            provider: provider.id
+                        });
+                        break;
+                    }
+                }
+            }
+        });
+        return () => { unsubscribe(); };
+    }, [onMessage, currentModel.id]);
+
+    // Sync Plan/Act mode with auto-approve settings
+    // ACT mode = auto-approve file edits, PLAN mode = require approval
+    useEffect(() => {
+        // When switching to ACT mode, enable auto-approve for edits
+        // When switching to PLAN mode, require approval
+        postMessage({
+            type: 'auto_approve_settings',
+            payload: {
+                enabled: !isPlanMode, // ACT mode enables auto-approve
+                editFiles: !isPlanMode,
+                readFiles: true, // Always auto-approve reads
+                executeSafeCommands: true,
+                executeAllCommands: false,
+                useBrowser: true,
+                useMcp: true
+            }
+        });
+    }, [isPlanMode, postMessage]);
+
+    // Fetch dynamic workflows
+    useEffect(() => {
+        // Request workflows
+        postMessage({ type: 'get_workflows' });
+
+        const unsubscribe = onMessage((msg: any) => {
+            if (msg.type === 'workflows_list') {
+                const workflows = msg.payload?.workflows || [];
+                const newCommands = workflows.map((w: any) => ({
+                    command: w.command,
+                    description: w.description
+                }));
+                // Merge distinct
+                setAvailableCommands([...DEFAULT_COMMANDS, ...newCommands]);
+            }
+        });
+        return () => { unsubscribe(); };
+    }, [onMessage, postMessage]);
 
     // Auto-resize textarea on value change
     useEffect(() => {
@@ -119,7 +182,7 @@ export function ChatInput(props: ChatInputProps) {
         // Slash Command Trigger
         if (newValue.startsWith('/')) {
             const query = newValue.substring(1).toLowerCase();
-            const matches = COMMANDS.filter(c => c.command.startsWith('/' + query));
+            const matches = availableCommands.filter(c => c.command.startsWith('/' + query));
             if (matches.length > 0) {
                 setFilteredCommands(matches);
                 setShowCommandMenu(true);
@@ -266,12 +329,12 @@ export function ChatInput(props: ChatInputProps) {
         setImages(prev => prev.filter((_, i) => i !== index));
     };
 
-    const currentModeData = MODES.find(m => m.slug === currentMode) || MODES[0];
+
 
     return (
         <div className="w-full relative">
             {/* Overlays / Modals (MUST BE FIRST FOR Z-INDEX) */}
-            {(showModeMenu || showModelMenu || showCommandMenu || showFileMenu) && (
+            {(showModelMenu || showCommandMenu || showFileMenu) && (
                 <div
                     className="fixed inset-0 z-[9998] bg-black/20 backdrop-blur-[2px]"
                     onClick={closeAllMenus}
@@ -286,6 +349,14 @@ export function ChatInput(props: ChatInputProps) {
                     onSelectModel={(model) => {
                         setCurrentModel(model);
                         setShowModelMenu(false);
+                        // CRITICAL: Send model selection to backend to update provider
+                        postMessage({
+                            type: 'save_settings',
+                            payload: {
+                                provider: model.provider,
+                                model: model.id
+                            }
+                        });
                     }}
                     currentMode={isPlanMode ? 'plan' : 'act'}
                     onModeChange={(mode) => setIsPlanMode(mode === 'plan')}
@@ -365,18 +436,6 @@ export function ChatInput(props: ChatInputProps) {
                     hover:bg-white/[0.05] focus-within:bg-white/[0.05]
                 `}
             >
-                {/* Remote Control Overlay */}
-                {isRemoteControl && (
-                    <div className="absolute inset-0 z-10 bg-vscode-editor-background/80 backdrop-blur-[1px] flex flex-col items-center justify-center text-center p-4 rounded-xl">
-                        <div className="flex items-center gap-2 text-blue-400 font-medium mb-1">
-                            <VoiceIcon className="w-5 h-5 animate-spin" />
-                            <span>Remote session active...</span>
-                        </div>
-                        <p className="text-xs text-vscode-fg/50">
-                            Check {liveStatus?.connectedVia} for details
-                        </p>
-                    </div>
-                )}
                 <textarea
                     ref={textareaRef}
                     value={value}
@@ -384,8 +443,8 @@ export function ChatInput(props: ChatInputProps) {
                     onKeyDown={handleKeyDown}
                     onPaste={handlePaste}
                     onDrop={handleDrop}
-                    placeholder={isRecording ? '🎙️ Listening...' : (isLiveMode ? '🔵 Ether active — control via messenger or type here...' : placeholder)}
-                    disabled={isLoading || isRemoteProcessing}
+                    placeholder={isRecording ? '🎙️ Listening...' : (isLiveMode ? 'Message remote agent...' : placeholder)}
+                    disabled={isLoading && !isLiveMode}
                     rows={1}
                     className={`
                         w-full resize-none py-3 px-3 rounded-t-xl
@@ -395,7 +454,7 @@ export function ChatInput(props: ChatInputProps) {
                         placeholder:text-vscode-fg/20
                         disabled:opacity-50 transition-colors
                         min-h-[60px] max-h-[200px]
-                        ${isLoading || isRemoteProcessing ? 'cursor-not-allowed opacity-50' : ''}
+                        ${isLoading ? 'cursor-not-allowed opacity-50' : ''}
                     `}
                 />
 
@@ -435,35 +494,7 @@ export function ChatInput(props: ChatInputProps) {
                         </button >
 
                         <div className="flex items-center gap-1 relative">
-                            <button
-                                onClick={() => setShowModeMenu(!showModeMenu)}
-                                className="inline-flex items-center gap-1.5 px-2 py-1.5 text-xs font-bold text-vscode-fg/40 hover:text-white/80 hover:bg-white/5 rounded-md transition-all"
-                            >
-                                <span className="uppercase tracking-widest text-[9px]">{currentModeData.name}</span>
-                                <ChevronDown className="w-3 h-3 opacity-30" />
-                            </button>
 
-                            {showModeMenu && (
-                                <div className="absolute bottom-full left-0 mb-2 min-w-[160px] bg-[#1e1e1e] rounded-xl shadow-[0_10px_30px_rgba(0,0,0,0.5)] border border-white/10 overflow-hidden z-[9999]">
-                                    <div className="p-1 px-2 py-1.5 text-[9px] uppercase tracking-widest text-white/20 font-bold border-b border-white/5 text-center">Mode</div>
-                                    <div className="p-1">
-                                        {MODES.map(mode => (
-                                            <button
-                                                key={mode.slug}
-                                                onClick={() => { onModeChange?.(mode.slug); setShowModeMenu(false); }}
-                                                className={`
-                                                    w-full flex items-center px-3 py-2 text-left text-xs rounded-lg transition-all
-                                                    ${mode.slug === currentMode
-                                                        ? 'bg-[#0e639c] text-white'
-                                                        : 'text-white/60 hover:bg-white/5 hover:text-white'}
-                                                `}
-                                            >
-                                                {mode.name}
-                                            </button>
-                                        ))}
-                                    </div>
-                                </div>
-                            )}
 
                             <button
                                 onClick={() => setShowModelMenu(!showModelMenu)}

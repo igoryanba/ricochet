@@ -88,11 +88,13 @@ func (r *Runner) Run(ctx context.Context, tc *TestCase) (*Result, error) {
 		Content:   tc.Prompt,
 	}
 
-	chatErr := ctrl.Chat(ctx, req, func(update agent.ChatUpdate) {
-		// We can collect tool usage here if needed for assertions
-		if update.Message.Role == "assistant" && len(update.Message.ToolCalls) > 0 {
-			for _, tc := range update.Message.ToolCalls {
-				result.Logs = append(result.Logs, fmt.Sprintf("Tool called: %s", tc.Name))
+	chatErr := ctrl.Chat(ctx, req, func(update interface{}) {
+		// Only check ChatUpdate for tool calls
+		if chatUpdate, ok := update.(agent.ChatUpdate); ok {
+			if chatUpdate.Message.Role == "assistant" && len(chatUpdate.Message.ToolCalls) > 0 {
+				for _, tc := range chatUpdate.Message.ToolCalls {
+					result.Logs = append(result.Logs, fmt.Sprintf("Tool called: %s", tc.Name))
+				}
 			}
 		}
 	})

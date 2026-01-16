@@ -4,11 +4,12 @@ import "encoding/json"
 
 // Message represents a chat message
 type Message struct {
-	Role        string            `json:"role"` // user, assistant, system
-	Content     string            `json:"content"`
-	ToolUse     []ToolUseBlock    `json:"tool_use,omitempty"`
-	ToolResults []ToolResultBlock `json:"tool_results,omitempty"`
-	Via         string            `json:"via,omitempty"` // Message source
+	Role             string            `json:"role"` // user, assistant, system
+	Content          string            `json:"content"`
+	ReasoningContent string            `json:"reasoning_content,omitempty"` // DeepSeek R1 reasoning
+	ToolUse          []ToolUseBlock    `json:"tool_use,omitempty"`
+	ToolResults      []ToolResultBlock `json:"tool_results,omitempty"`
+	Via              string            `json:"via,omitempty"` // Message source
 }
 
 // ToolUseBlock represents a tool call by the assistant
@@ -64,4 +65,30 @@ type Checkpoint struct {
 	Message   string `json:"message,omitempty"`
 	Timestamp int64  `json:"timestamp,omitempty"`
 	ToolName  string `json:"tool_name,omitempty"` // Which tool triggered this checkpoint
+}
+
+// Diagnostic represents a compiler/linter error or warning
+type Diagnostic struct {
+	File     string `json:"file"`
+	Line     int    `json:"line"`
+	Message  string `json:"message"`
+	Severity string `json:"severity"` // Error, Warning, Information
+}
+
+// DefinitionLocation represents a symbol definition
+type DefinitionLocation struct {
+	File      string `json:"file"`
+	StartLine int    `json:"start_line"`
+	EndLine   int    `json:"end_line"`
+}
+
+// TaskProgress represents structured task progress for UI display
+type TaskProgress struct {
+	TaskName string   `json:"task_name"`           // Header title
+	Status   string   `json:"status"`              // Current step description
+	Summary  string   `json:"summary,omitempty"`   // Overall summary
+	Mode     string   `json:"mode,omitempty"`      // planning, execution, verification
+	Steps    []string `json:"steps,omitempty"`     // Progress history
+	Files    []string `json:"files,omitempty"`     // Files modified during task
+	IsActive bool     `json:"is_active,omitempty"` // Whether task is still in progress
 }

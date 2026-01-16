@@ -17,6 +17,7 @@ import (
 	mcpHubPkg "github.com/igoryan-dao/ricochet/internal/mcp"
 	"github.com/igoryan-dao/ricochet/internal/modes"
 	"github.com/igoryan-dao/ricochet/internal/safeguard"
+	"github.com/igoryan-dao/ricochet/internal/workflow"
 )
 
 // Tool execution interface
@@ -47,11 +48,12 @@ type NativeExecutor struct {
 	mcpHub         *mcpHubPkg.Hub
 	indexer        *index.Indexer
 	codegraph      *codegraph.Service
+	workflows      *workflow.Manager
 	livemode       LiveModeProvider
 	shadowVerifier *safeguard.ShadowVerifier
 }
 
-func NewNativeExecutor(h host.Host, m *modes.Manager, sg *safeguard.Manager, mcpHub *mcpHubPkg.Hub, idx *index.Indexer, cg *codegraph.Service) *NativeExecutor {
+func NewNativeExecutor(h host.Host, m *modes.Manager, sg *safeguard.Manager, mcpHub *mcpHubPkg.Hub, idx *index.Indexer, cg *codegraph.Service, wm *workflow.Manager) *NativeExecutor {
 	return &NativeExecutor{
 		host:           h,
 		modes:          m,
@@ -60,6 +62,7 @@ func NewNativeExecutor(h host.Host, m *modes.Manager, sg *safeguard.Manager, mcp
 		mcpHub:         mcpHub,
 		indexer:        idx,
 		codegraph:      cg,
+		workflows:      wm,
 		shadowVerifier: safeguard.NewShadowVerifier(),
 	}
 }
@@ -102,10 +105,23 @@ func (e *NativeExecutor) Execute(ctx context.Context, name string, args json.Raw
 		return e.BrowserClick(ctx, args)
 	case "browser_type":
 		return e.BrowserType(ctx, args)
+	case "get_diagnostics":
+		return e.GetDiagnostics(ctx, args)
+	case "get_definitions":
+		return e.GetDefinitionsLSP(ctx, args)
 	case "switch_mode":
 		return e.SwitchMode(args)
 	case "update_todos":
 		return "Interpreted by controller", nil
+	case "get_workflows":
+		return e.GetWorkflows(ctx, args)
+	case "start_task":
+		return e.handleStartTask(ctx, args)
+
+	case "replace_file_content":
+		// This method is defined in fs_tools.go but called on NativeExecutor
+		return e.ReplaceFileContent(ctx, args)
+
 	case "execute_python":
 		return e.ExecutePythonTool(ctx, args)
 	default:
@@ -185,7 +201,7 @@ func (e *NativeExecutor) GetDefinitions() []ToolDefinition {
 		},
 		{
 			Name:        "write_file",
-			Description: "Write content to a file. CAUTION: Overwrites existing files.",
+			Description: "Create a NEW file or completely overwrite an existing one. Use 'replace_file_content' for editing.",
 			InputSchema: map[string]interface{}{
 				"type": "object",
 				"properties": map[string]interface{}{
@@ -199,6 +215,28 @@ func (e *NativeExecutor) GetDefinitions() []ToolDefinition {
 					},
 				},
 				"required": []string{"path", "content"},
+			},
+		},
+		{
+			Name:        "replace_file_content",
+			Description: "Edit an existing file by replacing specific content. PREFERRED over write_file for edits. PRESERVES history.",
+			InputSchema: map[string]interface{}{
+				"type": "object",
+				"properties": map[string]interface{}{
+					"path": map[string]interface{}{
+						"type":        "string",
+						"description": "File path to edit",
+					},
+					"TargetContent": map[string]interface{}{
+						"type":        "string",
+						"description": "The exact text chunk to verify and replace (must match exactly)",
+					},
+					"ReplacementContent": map[string]interface{}{
+						"type":        "string",
+						"description": "The new content to write",
+					},
+				},
+				"required": []string{"path", "TargetContent", "ReplacementContent"},
 			},
 		},
 		{
@@ -338,6 +376,50 @@ func (e *NativeExecutor) GetDefinitions() []ToolDefinition {
 			"required": []string{"path"},
 		},
 	})
+
+	// Add LSP tools
+	defs = append(defs, ToolDefinition{
+		Name:        "get_diagnostics",
+		Description: "Get diagnostics (errors/warnings) for a file from the IDE.",
+		InputSchema: map[string]interface{}{
+			"type": "object",
+			"properties": map[string]interface{}{
+				"path": map[string]interface{}{
+					"type":        "string",
+					"description": "File path to check",
+				},
+			},
+			"required": []string{"path"},
+		},
+	}, ToolDefinition{
+		Name:        "get_definitions",
+		Description: "Get symbol definitions via LSP (Go to Definition). Preferred over read_definitions for precise lookups.",
+		InputSchema: map[string]interface{}{
+			"type": "object",
+			"properties": map[string]interface{}{
+				"path": map[string]interface{}{
+					"type":        "string",
+					"description": "File path",
+				},
+				"line": map[string]interface{}{
+					"type":        "integer",
+					"description": "Line number (1-indexed)",
+				},
+				"character": map[string]interface{}{
+					"type":        "integer",
+					"description": "Character position (0-indexed)",
+				},
+			},
+			"required": []string{"path", "line", "character"},
+		},
+	}, ToolDefinition{
+		Name:        "get_workflows",
+		Description: "Get list of available workflow commands defined in .agent/workflows. Used for autocomplete.",
+		InputSchema: map[string]interface{}{"type": "object", "properties": map[string]interface{}{}},
+	})
+
+	// Add Task Workspace tools
+	defs = append(defs, StartTaskTool)
 
 	// Add browser tools
 	defs = append(defs, ToolDefinition{

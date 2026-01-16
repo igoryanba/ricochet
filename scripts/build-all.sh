@@ -11,36 +11,34 @@ echo "🔧 Building Ricochet Core..."
 # Build for current platform
 cd "$CORE_DIR"
 
-PLATFORMS=("darwin/amd64" "darwin/arm64" "linux/amd64" "linux/arm64" "windows/amd64")
+# Build for current platform only (Tree-sitter requires CGO which breaks cross-compilation)
+PLATFORM_OS=$(go env GOOS)
+PLATFORM_ARCH=$(go env GOARCH)
 
-for PLATFORM in "${PLATFORMS[@]}"; do
-    OS="${PLATFORM%/*}"
-    ARCH="${PLATFORM#*/}"
-    
-    # Map to Node.js naming convention
-    NODE_OS=$OS
-    NODE_ARCH=$ARCH
-    
-    if [ "$OS" = "windows" ]; then
-        NODE_OS="win32"
-    fi
-    
-    if [ "$ARCH" = "amd64" ]; then
-        NODE_ARCH="x64"
-    fi
-    
-    OUTPUT_DIR="$EXT_DIR/bin/${NODE_OS}-${NODE_ARCH}"
-    OUTPUT_NAME="ricochet-core"
-    
-    if [ "$OS" = "windows" ]; then
-        OUTPUT_NAME="${OUTPUT_NAME}.exe"
-    fi
-    
-    echo "  Building for $OS/$ARCH -> $OUTPUT_DIR..."
-    mkdir -p "$OUTPUT_DIR"
-    
-    GOOS=$OS GOARCH=$ARCH go build -ldflags="-s -w" -o "$OUTPUT_DIR/$OUTPUT_NAME" ./cmd/ricochet
-done
+# Map to Node.js naming
+NODE_OS=$PLATFORM_OS
+NODE_ARCH=$PLATFORM_ARCH
+
+if [ "$PLATFORM_OS" = "windows" ]; then
+    NODE_OS="win32"
+fi
+
+if [ "$PLATFORM_ARCH" = "amd64" ]; then
+    NODE_ARCH="x64"
+fi
+
+OUTPUT_DIR="$EXT_DIR/bin/${NODE_OS}-${NODE_ARCH}"
+OUTPUT_NAME="ricochet-core"
+
+if [ "$PLATFORM_OS" = "windows" ]; then
+    OUTPUT_NAME="${OUTPUT_NAME}.exe"
+fi
+
+echo "  Building for Native ($PLATFORM_OS/$PLATFORM_ARCH) -> $OUTPUT_DIR..."
+mkdir -p "$OUTPUT_DIR"
+
+# CGO_ENABLED=1 is required for go-tree-sitter
+CGO_ENABLED=1 go build -ldflags="-s -w" -o "$OUTPUT_DIR/$OUTPUT_NAME" ./cmd/ricochet
 
 echo "✅ Core builds complete!"
 echo ""

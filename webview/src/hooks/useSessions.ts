@@ -10,13 +10,13 @@ export function useSessions() {
     useEffect(() => {
         const unsubscribe = onMessage((message) => {
             switch (message.type) {
-                case 'sessions_list':
-                    setSessions((message.payload as { sessions: SessionMetadata[] }).sessions);
+                case 'session_list':
+                    setSessions((message.payload as { sessions: SessionMetadata[] }).sessions || []);
                     break;
                 case 'session_created':
                     setCurrentSessionId((message.payload as { id: string }).id);
                     // Refresh list
-                    postMessage({ type: 'get_sessions' });
+                    postMessage({ type: 'list_sessions' });
                     break;
                 case 'session_loaded':
                     // Handled by useChat mostly, but we update current ID here
@@ -26,7 +26,7 @@ export function useSessions() {
         });
 
         // Initial fetch
-        postMessage({ type: 'get_sessions' });
+        postMessage({ type: 'list_sessions' });
 
         return () => { unsubscribe(); };
     }, [postMessage, onMessage]);

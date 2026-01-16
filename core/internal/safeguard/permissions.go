@@ -23,7 +23,7 @@ type TrustZone int
 
 // ZoneConfig maps tools to their minimum required zone (Lower zone = Higher trust required)
 var toolZoneMap = map[string]TrustZone{
-	"execute_command": ZoneDanger,   // Dangerous
+	"execute_command": ZoneSafe,     // Safe (Protected by IsSafeCommand + ensureConsent)
 	"write_file":      ZoneSafe,     // Safe (Project only)
 	"execute_python":  ZoneSafe,     // Safe (Sandboxed - theoretically)
 	"read_file":       ZoneReadOnly, // Read only

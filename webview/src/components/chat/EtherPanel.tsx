@@ -17,6 +17,7 @@ interface EtherPanelProps {
     status: EtherStatus;
     isMinimized?: boolean;
     onToggleMinimize?: () => void;
+    onToggleLiveMode?: (enabled: boolean) => void;
 }
 
 const STAGE_CONFIG: Record<EtherStage, { icon: React.ReactNode; text: string; color: string }> = {
@@ -64,7 +65,7 @@ function VoiceIcon({ className }: { className?: string }) {
  * Displays connection status, stage, and last activity from messenger.
  * Apple-style glassmorphism with pulsing blue glow.
  */
-export function EtherPanel({ status, isMinimized: externalMinimized, onToggleMinimize }: EtherPanelProps) {
+export function EtherPanel({ status, isMinimized: externalMinimized, onToggleMinimize, onToggleLiveMode }: EtherPanelProps) {
     const [internalMinimized, setInternalMinimized] = useState(false);
     const isMinimized = externalMinimized ?? internalMinimized;
 
@@ -108,6 +109,12 @@ export function EtherPanel({ status, isMinimized: externalMinimized, onToggleMin
                     <span className="text-[10px] font-bold uppercase tracking-widest text-blue-400">
                         Ether
                     </span>
+                    {status.stage !== 'idle' && (
+                        <span className="flex h-1.5 w-1.5 relative ml-1">
+                            <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-green-400 opacity-75"></span>
+                            <span className="relative inline-flex rounded-full h-1.5 w-1.5 bg-green-500"></span>
+                        </span>
+                    )}
                 </div>
 
                 <div className="flex items-center gap-2">
@@ -118,6 +125,15 @@ export function EtherPanel({ status, isMinimized: externalMinimized, onToggleMin
                             {status.connectedVia || 'Offline'}
                         </span>
                     </div>
+
+                    {/* Disconnect button */}
+                    <button
+                        onClick={() => onToggleLiveMode?.(false)}
+                        className="p-0.5 text-white/30 hover:text-red-400 transition-colors mr-1"
+                        title="Disconnect Live Mode"
+                    >
+                        <WifiOff className="w-3 h-3" />
+                    </button>
 
                     {/* Minimize button */}
                     <button

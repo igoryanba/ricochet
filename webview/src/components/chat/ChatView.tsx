@@ -1,12 +1,16 @@
-import { useRef } from 'react';
+import { useRef, useState, useMemo, useEffect } from 'react';
 import { useChat } from '@hooks/useChat';
 import { ChatMessage } from './ChatMessage';
 import { ChatInput } from './ChatInput';
 import { AutoApprovePanel } from './AutoApprovePanel';
 import { EtherPanel } from './EtherPanel';
 import { TodoTracker } from './TodoTracker';
-import { Virtuoso, VirtuosoHandle } from 'react-virtuoso';
+// import { PermissionRequestPanel } from './PermissionRequestPanel'';
+// import { Virtuoso, VirtuosoHandle } from 'react-virtuoso'; // TEMPORARILY DISABLED
 import { useLiveMode } from '@hooks/useLiveMode';
+import { useVSCodeApi } from '@hooks/useVSCodeApi';
+import { useSessions } from '@hooks/useSessions';
+import { ChevronDown, ChevronRight } from 'lucide-react';
 
 interface ChatViewProps {
     onOpenSettings: () => void;
@@ -14,14 +18,33 @@ interface ChatViewProps {
     onOpenAgent: () => void;
 }
 
+// interface PermissionRequest {
+//     id: string;
+//     question: string;
+// }
+
 /**
  * Main Chat View for Ricochet.
  * Single panel, settings in bottom toolbar, minimal top bar.
  */
 export function ChatView({ onOpenSettings }: ChatViewProps) {
-    const { messages, todos, isLoading, inputValue, setInputValue, sendMessage, cancelGeneration, executeCommand, restoreCheckpoint } = useChat('default');
-    const { status: liveStatus } = useLiveMode();
-    const virtuosoRef = useRef<VirtuosoHandle>(null);
+    const { currentSessionId } = useSessions();
+    const { messages, todos, isLoading, inputValue, setInputValue, sendMessage, cancelGeneration, executeCommand, restoreCheckpoint } = useChat(currentSessionId || 'default');
+    const { status: liveStatus, toggleLiveMode } = useLiveMode();
+    const scrollRef = useRef<HTMLDivElement>(null);
+    // Auto-respond to permission requests to prevent Promise deadlock
+    // (Actual approval comes from Telegram in Live Mode)
+    const { onMessage } = useVSCodeApi();
+    useEffect(() => {
+        const unsubscribe = onMessage((message: any) => {
+            if (message.type === 'request_permission') {
+                // Just log it - don't block, let Telegram handle actual approval
+                console.log('[ChatView] Permission request received (handled by Telegram):', message.payload?.question?.slice(0, 50));
+                // Note: We don't auto-respond here because Telegram will respond via core
+            }
+        });
+        return () => { unsubscribe(); };
+    }, [onMessage]);
 
     const handleSend = (text?: string) => {
         const msg = typeof text === 'string' ? text : inputValue;
@@ -29,8 +52,51 @@ export function ChatView({ onOpenSettings }: ChatViewProps) {
         sendMessage(msg);
     };
 
+    // Extract task topic from first user message (Kilo Code style)
+    const fullTaskTopic = useMemo(() => {
+        const firstUserMsg = messages.find(m => m.role === 'user');
+        return firstUserMsg?.content || null;
+    }, [messages]);
+
+    const [taskExpanded, setTaskExpanded] = useState(false);
+
+    // Show truncated in header, full when expanded
+    const displayTopic = fullTaskTopic
+        ? (taskExpanded ? fullTaskTopic : (fullTaskTopic.length > 80 ? fullTaskTopic.slice(0, 80) + '...' : fullTaskTopic))
+        : null;
+
     return (
         <div className="flex flex-col h-full bg-vscode-sideBar-background text-vscode-fg">
+            <style>{`
+                @keyframes fadeIn {
+                    from { opacity: 0; transform: translateY(4px); }
+                    to { opacity: 1; transform: translateY(0); }
+                }
+                .animate-fade-in {
+                    animation: fadeIn 0.4s cubic-bezier(0.4, 0, 0.2, 1) forwards;
+                }
+            `}</style>
+
+            {/* Task Header - Kilo Code style sticky top */}
+            {fullTaskTopic && (
+                <div className="sticky top-0 z-10 bg-[#1e1e1e] border-b border-[#333] shadow-md">
+                    <button
+                        onClick={() => setTaskExpanded(!taskExpanded)}
+                        className="w-full flex items-start gap-2 px-3 py-2 hover:bg-[#252526] transition-colors text-left"
+                    >
+                        {taskExpanded ? (
+                            <ChevronDown className="w-4 h-4 text-vscode-fg/50 flex-shrink-0 mt-0.5" />
+                        ) : (
+                            <ChevronRight className="w-4 h-4 text-vscode-fg/50 flex-shrink-0 mt-0.5" />
+                        )}
+                        <span className="text-xs text-blue-400 font-medium flex-shrink-0 mt-0.5">Task:</span>
+                        <span className={`text-xs text-vscode-fg/80 flex-1 ${taskExpanded ? 'whitespace-pre-wrap' : 'truncate'}`}>
+                            {displayTopic}
+                        </span>
+                    </button>
+                </div>
+            )}
+
             {/* Content area */}
             <div className="flex-1 min-h-0 flex flex-col pt-0.5">
                 <TodoTracker todos={todos} />
@@ -39,21 +105,19 @@ export function ChatView({ onOpenSettings }: ChatViewProps) {
                     {messages.length === 0 ? (
                         <WelcomeMessage />
                     ) : (
-                        <Virtuoso
-                            ref={virtuosoRef}
-                            className="h-full"
-                            data={messages}
-                            initialTopMostItemIndex={messages.length - 1}
-                            followOutput="smooth"
-                            itemContent={(_index, message) => (
+                        <div
+                            ref={scrollRef}
+                            className="h-full overflow-y-auto"
+                        >
+                            {messages.map((message) => (
                                 <ChatMessage
                                     key={message.id}
                                     message={message}
                                     onExecuteCommand={executeCommand}
                                     onRestore={restoreCheckpoint}
                                 />
-                            )}
-                        />
+                            ))}
+                        </div>
                     )}
                 </div>
             </div>
@@ -61,7 +125,16 @@ export function ChatView({ onOpenSettings }: ChatViewProps) {
             {/* Bottom Input Area */}
             <div className="bg-vscode-editor-background">
                 <AutoApprovePanel />
-                {liveStatus.enabled && <EtherPanel status={liveStatus} />}
+                {liveStatus.enabled && <EtherPanel status={liveStatus} onToggleLiveMode={() => toggleLiveMode()} />}
+
+                {/* Permission Request Panel - TEMPORARILY DISABLED FOR DEBUGGING */}
+                {/* {permissionRequest && (
+                    <PermissionRequestPanel
+                        request={permissionRequest}
+                        onResponse={handlePermissionResponse}
+                    />
+                )} */}
+
                 <ChatInput
                     value={inputValue}
                     onChange={setInputValue}
@@ -69,6 +142,8 @@ export function ChatView({ onOpenSettings }: ChatViewProps) {
                     isLoading={isLoading}
                     onCancel={cancelGeneration}
                     onOpenSettings={onOpenSettings}
+                    liveStatus={liveStatus}
+                    onToggleLiveMode={toggleLiveMode}
                 />
             </div>
         </div>

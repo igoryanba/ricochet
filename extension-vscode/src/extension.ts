@@ -1,6 +1,7 @@
 import * as vscode from 'vscode';
 import { WebviewProvider } from './webview-provider';
 import { CoreProcess } from './core-process';
+import { LanguageService } from './services/language';
 
 let coreProcess: CoreProcess | undefined;
 
@@ -14,6 +15,9 @@ export async function activate(context: vscode.ExtensionContext) {
     // Start the Go core process
     coreProcess = new CoreProcess(workspacePath, context.extensionPath);
     await coreProcess.start();
+
+    // Initialize Language Service (LSP Bridge)
+    new LanguageService(coreProcess);
 
     // Register webview provider
     const webviewProvider = new WebviewProvider(context, coreProcess);

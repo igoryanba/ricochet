@@ -14,6 +14,8 @@ func BuildSystemPrompt(cwd string) string {
 	sb.WriteString("\n\n")
 	sb.WriteString(GetRules())
 	sb.WriteString("\n\n")
+	sb.WriteString(GetMetaCognition())
+	sb.WriteString("\n\n")
 	// Note: Initial context (file tree) provides dynamic info but usually goes into the
 	// first user message or a dedicated system section. For now we append it here.
 	// In strict Chat implementations, this might be better placed in the first User message,

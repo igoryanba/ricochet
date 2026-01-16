@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -22,9 +23,12 @@ import (
 	"github.com/igoryan-dao/ricochet/internal/modes"
 	"github.com/igoryan-dao/ricochet/internal/paths"
 	"github.com/igoryan-dao/ricochet/internal/protocol"
+	"github.com/igoryan-dao/ricochet/internal/qc"
 	"github.com/igoryan-dao/ricochet/internal/rules"
 	"github.com/igoryan-dao/ricochet/internal/safeguard"
+	"github.com/igoryan-dao/ricochet/internal/skills"
 	"github.com/igoryan-dao/ricochet/internal/tools"
+	"github.com/igoryan-dao/ricochet/internal/workflow"
 )
 
 // Controller manages chat sessions and AI interactions
@@ -45,16 +49,24 @@ type Controller struct {
 
 	codegraph      *codegraph.Service
 	handoffService *handoff.Service
+	workflows      *workflow.Manager
+	skills         *skills.Manager
+	qcManager      *qc.Manager
+
+	// Abort support
+	abortMu     sync.Mutex
+	abortCancel context.CancelFunc
 }
 
 // Config holds agent configuration
 type Config struct {
-	Provider          ProviderConfig  `json:"provider"`
-	EmbeddingProvider *ProviderConfig `json:"embedding_provider,omitempty"`
-	SystemPrompt      string          `json:"system_prompt"`
-	MaxTokens         int             `json:"max_tokens"`     // Max tokens for response generation
-	ContextWindow     int             `json:"context_window"` // Context window limit for pruning
-	EnableCodeIndex   bool            `json:"enable_code_index"`
+	Provider          ProviderConfig               `json:"provider"`
+	EmbeddingProvider *ProviderConfig              `json:"embedding_provider,omitempty"`
+	SystemPrompt      string                       `json:"system_prompt"`
+	MaxTokens         int                          `json:"max_tokens"`     // Max tokens for response generation
+	ContextWindow     int                          `json:"context_window"` // Context window limit for pruning
+	EnableCodeIndex   bool                         `json:"enable_code_index"`
+	AutoApproval      *config.AutoApprovalSettings `json:"auto_approval"`
 }
 
 // Session represents a chat session
@@ -75,6 +87,7 @@ type ControllerOptions struct {
 	McpHub           *mcpHubPkg.Hub
 	ProvidersManager *config.ProvidersManager
 	Codegraph        *codegraph.Service
+	WorkflowManager  *workflow.Manager
 }
 
 // NewController creates a new agent controller
@@ -92,6 +105,7 @@ func NewController(cfg *Config, opts ...ControllerOptions) (*Controller, error) 
 	var mcpHub *mcpHubPkg.Hub
 	var pm *config.ProvidersManager
 	var cg *codegraph.Service
+	var wm *workflow.Manager
 
 	if len(opts) > 0 {
 		h = opts[0].Host
@@ -100,6 +114,7 @@ func NewController(cfg *Config, opts ...ControllerOptions) (*Controller, error) 
 		mcpHub = opts[0].McpHub
 		pm = opts[0].ProvidersManager
 		cg = opts[0].Codegraph
+		wm = opts[0].WorkflowManager
 	}
 
 	if h == nil {
@@ -113,11 +128,16 @@ func NewController(cfg *Config, opts ...ControllerOptions) (*Controller, error) 
 	}
 	// mcpHub can be nil
 	// cg (codegraph) can be nil (feature disabled or not provided)
+	if wm == nil {
+		wm = workflow.NewManager(cwd)
+	}
 
 	// Initialize safeguard manager
 	safeguardMgr, err := safeguard.NewManager(cwd)
 	if err != nil {
 		log.Printf("Warning: Failed to initialize safeguard manager: %v", err)
+	} else if cfg.AutoApproval != nil {
+		safeguardMgr.SetAutoApproval(cfg.AutoApproval)
 	}
 
 	// Initialize Embedder
@@ -143,7 +163,16 @@ func NewController(cfg *Config, opts ...ControllerOptions) (*Controller, error) 
 	store, _ := index.NewLocalStore(indexPath)
 	indexer := index.NewIndexer(store, embedder, cwd)
 
-	executor := tools.NewNativeExecutor(h, mm, safeguardMgr, mcpHub, indexer, cg)
+	// Initialize Skill Manager
+	skillMgr := skills.NewManager(cwd)
+	if err := skillMgr.LoadSkills(); err != nil {
+		log.Printf("Warning: Failed to load skills: %v", err)
+	}
+
+	// Initialize QC Manager
+	qcMgr := qc.NewManager(cwd)
+
+	executor := tools.NewNativeExecutor(h, mm, safeguardMgr, mcpHub, indexer, cg, wm)
 
 	// Trigger indexing in background
 	if cfg.EnableCodeIndex {
@@ -190,6 +219,8 @@ func NewController(cfg *Config, opts ...ControllerOptions) (*Controller, error) 
 		host:             h,
 		providersManager: pm,
 		indexer:          indexer,
+		skills:           skillMgr,
+		qcManager:        qcMgr,
 		handoffService: handoff.NewService(func(ctx context.Context, prompt string) (string, error) {
 			req := &ChatRequest{
 				Model:     cfg.Provider.Model,
@@ -224,9 +255,24 @@ func (c *Controller) SetLiveMode(lm tools.LiveModeProvider) {
 	}
 }
 
+// AbortCurrentSession cancels any running chat session
+func (c *Controller) AbortCurrentSession() {
+	c.abortMu.Lock()
+	defer c.abortMu.Unlock()
+	if c.abortCancel != nil {
+		log.Printf("[Controller] Aborting current session...")
+		c.abortCancel()
+		c.abortCancel = nil
+	}
+}
+
 // CreateSession creates a new session
 func (c *Controller) CreateSession() *Session {
-	return c.sessionManager.CreateSession()
+	s := c.sessionManager.CreateSession()
+	if c.workflows != nil {
+		c.workflows.Hooks.Trigger("on_session_created")
+	}
+	return s
 }
 
 // GetSession returns a session by ID, creating if not exists
@@ -317,7 +363,18 @@ type ToolCallInfo struct {
 }
 
 // Chat sends a message and returns response via streaming
-func (c *Controller) Chat(ctx context.Context, input ChatRequestInput, callback func(update ChatUpdate)) error {
+func (c *Controller) Chat(ctx context.Context, input ChatRequestInput, callback func(update interface{})) error {
+	// Create cancellable context for abort support
+	ctx, cancel := context.WithCancel(ctx)
+	c.abortMu.Lock()
+	c.abortCancel = cancel
+	c.abortMu.Unlock()
+	defer func() {
+		c.abortMu.Lock()
+		c.abortCancel = nil
+		c.abortMu.Unlock()
+	}()
+
 	session := c.GetSession(input.SessionID)
 
 	// Add user message if content provided
@@ -330,7 +387,62 @@ func (c *Controller) Chat(ctx context.Context, input ChatRequestInput, callback 
 		session.StateHandler.AddMessage(userMsg)
 	}
 
-	// Helper to emit updates
+	// Track edited files for task progress
+	taskFiles := make(map[string]bool)
+
+	// Helper to emit task progress
+	emitTaskProgress := func(status string, newFiles []string) {
+		// Update file list
+		for _, f := range newFiles {
+			taskFiles[f] = true
+		}
+
+		// Convert map to slice
+		var fileList []string
+		for f := range taskFiles {
+			fileList = append(fileList, f)
+		}
+
+		// Construct task payload
+		progress := protocol.TaskProgress{
+			TaskName: "Implementing Feature", // TODO: Determined dynamically
+			Status:   status,
+			Steps:    []string{status},
+			Files:    fileList,
+			IsActive: true,
+			Mode:     "execution",
+		}
+
+		// Persist to task_progress_current.md (User Request Parity)
+		// We write this to the workspace root to mimic Antigravity's behavior
+		taskMdContent := fmt.Sprintf("# Task Progress: %s\n\n", progress.TaskName)
+		taskMdContent += fmt.Sprintf("**Status**: %s\n", status)
+		taskMdContent += fmt.Sprintf("**Mode**: %s\n\n", progress.Mode)
+
+		taskMdContent += "## Files Edited\n"
+		if len(fileList) == 0 {
+			taskMdContent += "- (No files edited yet)\n"
+		} else {
+			for _, f := range fileList {
+				taskMdContent += fmt.Sprintf("- `%s`\n", filepath.Base(f))
+			}
+		}
+
+		taskMdContent += "\n## Progress Log\n"
+		// In a real implementation we would accumulate these steps in state,
+		// but for now we'll just show the latest status as the active step
+		taskMdContent += fmt.Sprintf("- [x] %s\n", status)
+
+		// Best effort write - ignore errors to not block flow
+		// Derive workspace root from session or cwd
+		if cwd, err := os.Getwd(); err == nil {
+			_ = os.WriteFile(filepath.Join(cwd, "task_progress_current.md"), []byte(taskMdContent), 0644)
+		}
+
+		callback(progress)
+	}
+
+	// Helper to emit chat updates is already defined below...
 	emitUpdate := func(msg ChatMessage) {
 		callback(ChatUpdate{
 			SessionID: input.SessionID,
@@ -401,10 +513,10 @@ func (c *Controller) Chat(ctx context.Context, input ChatRequestInput, callback 
 			model: c.config.Provider.Model,
 		}
 
-		// Configure Smart Context settings
+		// Configure Smart Context settings (Reflex Engine)
 		ctxSettings := &context_manager.ContextSettings{
 			AutoCondense:         true,
-			CondenseThreshold:    75, // Start condensing at 75% usage to be safe
+			CondenseThreshold:    70, // Start condensing at 70% usage
 			SlidingWindowSize:    20,
 			ShowContextIndicator: true,
 		}
@@ -413,7 +525,11 @@ func (c *Controller) Chat(ctx context.Context, input ChatRequestInput, callback 
 
 		contextResult, err := wm.ManageContext(ctx, currentMessages, c.config.SystemPrompt)
 		if err != nil {
-			return fmt.Errorf("context management failed: %w", err)
+			return fmt.Errorf("context management failure (Reflex Engine): %w", err)
+		}
+
+		if contextResult.WasCondensed {
+			log.Printf("🧠 Reflex Engine: Context condensed (Summary length: %d chars)", len(contextResult.Summary))
 		}
 
 		// Inject CodeGraph Repo Map if available (Repo Intelligence)
@@ -443,17 +559,39 @@ func (c *Controller) Chat(ctx context.Context, input ChatRequestInput, callback 
 
 		rulesContext := c.rules.GetRules()
 
-		// Combine system prompt parts (Base + Mode + Rules + RepoMap if any)
+		// Skill Injection (Hardcore Workflow)
+		var skillContext string
+		if c.skills != nil && input.Content != "" {
+			// Gather active files from trackers
+			activeFiles := session.FileTracker.GetFiles()
+
+			matchedSkills := c.skills.FindApplicableSkills(input.Content, activeFiles)
+			if len(matchedSkills) > 0 {
+				var sb strings.Builder
+				sb.WriteString("\n\n### 🧠 Active Skills (Auto-Activated)\n")
+				for _, skill := range matchedSkills {
+					sb.WriteString(fmt.Sprintf("#### Skill: %s (%s)\n%s\n\n", skill.Name, skill.Enforcement, skill.Content))
+				}
+				skillContext = sb.String()
+				log.Printf("🧠 Skills Activated: %d skills injected into context", len(matchedSkills))
+			}
+		}
+
+		// Combine system prompt parts (Base + Mode + Rules + Skills + RepoMap if any)
 		// Usually Controller logic appends to c.config.SystemPrompt,
 		// but here finalSystemPrompt already has repoMap if any.
 		// Let's ensure we merge correctly.
 		// If Repomap was appended to finalSystemPrompt, we should use that base.
 
 		// Re-construct system prompt to be safe and ordered
-		enhancedSystemPrompt := finalSystemPrompt + modePrompt + rulesContext + "\n\n" + c.envTracker.GetContext() + "\n" + session.FileTracker.GetContext()
+		enhancedSystemPrompt := finalSystemPrompt + modePrompt + rulesContext + skillContext + "\n\n" + c.envTracker.GetContext() + "\n" + session.FileTracker.GetContext()
 
 		// Use contextResult.Messages as prunedMessages
 		prunedMessages := contextResult.Messages
+
+		// SAFETY: Sanitize messages to ensure Tool Call/Result integrity
+		// This prevents API 400 errors if a previous session crashed/was pruned incorrectly
+		prunedMessages = c.sanitizeMessages(prunedMessages)
 
 		req := &ChatRequest{
 			Model:        c.config.Provider.Model,
@@ -527,7 +665,14 @@ func (c *Controller) Chat(ctx context.Context, input ChatRequestInput, callback 
 		})
 
 		var currentTurnContent string
+		var currentTurnReasoning string // Track reasoning separately for DeepSeek R1
 		var currentTurnToolCalls []ToolCallInfo
+
+		// Throttling for streaming updates to prevent webview crash
+		// Reduced to 50ms for smoother experience while still preventing overflow
+		var lastEmitTime time.Time
+		const streamThrottleInterval = 50 * time.Millisecond
+		var firstChunk = true // Track first chunk to always emit it
 
 		// Stream response from AI using standard ChatStream
 		// We use prunedMessages (from context management) instead of session messages
@@ -537,6 +682,11 @@ func (c *Controller) Chat(ctx context.Context, input ChatRequestInput, callback 
 				currentTurnContent += chunk.Delta
 				assistantMsg.Content += chunk.Delta
 				assistantMsg.IsStreaming = true
+
+				// Accumulate reasoning separately for DeepSeek R1 tool call support
+				if chunk.ReasoningDelta != "" {
+					currentTurnReasoning += chunk.ReasoningDelta
+				}
 
 				// Update Output Tokens - Heuristic
 				deltaTokens := len(chunk.Delta) / 4
@@ -548,7 +698,15 @@ func (c *Controller) Chat(ctx context.Context, input ChatRequestInput, callback 
 				turnCost := calcCost(totalTokensIn, totalTokensOut)
 				assistantMsg.Metadata.TotalCost = turnCost
 
-				emitUpdate(assistantMsg)
+				// Throttle streaming updates to prevent webview overflow
+				// BUT always emit: first chunk, thinking tags (reasoning), and after throttle interval
+				now := time.Now()
+				isReasoningTag := strings.Contains(chunk.Delta, "<thinking>") || strings.Contains(chunk.Delta, "</thinking>")
+				if firstChunk || isReasoningTag || now.Sub(lastEmitTime) >= streamThrottleInterval {
+					emitUpdate(assistantMsg)
+					lastEmitTime = now
+					firstChunk = false
+				}
 
 			case "tool_use":
 				if chunk.ToolUse != nil {
@@ -589,15 +747,19 @@ func (c *Controller) Chat(ctx context.Context, input ChatRequestInput, callback 
 		}
 
 		session.StateHandler.AddMessage(protocol.Message{
-			Role:    "assistant",
-			Content: currentTurnContent,
-			ToolUse: storedToolUse,
+			Role:             "assistant",
+			Content:          currentTurnContent,
+			ReasoningContent: currentTurnReasoning, // DeepSeek R1 requires this for tool calls
+			ToolUse:          storedToolUse,
 		})
 
 		// If no tools used, we are done
 		if len(currentTurnToolCalls) == 0 {
 			break
 		}
+
+		// Initialize QC flag
+		runQC := false
 
 		// EXECUTE TOOLS
 		log.Printf("Executing %d tools...", len(currentTurnToolCalls))
@@ -718,6 +880,23 @@ func (c *Controller) Chat(ctx context.Context, input ChatRequestInput, callback 
 				}
 			}
 
+			// Track file edits for task progress
+			if !isError && (tc.Name == "write_file" || tc.Name == "replace_file_content" || tc.Name == "write_to_file") {
+				var argsMap map[string]interface{}
+				if json.Unmarshal([]byte(tc.Arguments), &argsMap) == nil {
+					var target string
+					if t, ok := argsMap["TargetFile"].(string); ok {
+						target = t
+					} else if t, ok := argsMap["AbsolutePath"].(string); ok {
+						target = t
+					}
+
+					if target != "" {
+						emitTaskProgress(fmt.Sprintf("Edited %s", path.Base(target)), []string{target})
+					}
+				}
+			}
+
 			// Auto-checkpoint after write operations
 			if !isError && c.checkpointService != nil && isWriteTool(tc.Name) {
 				hash, cpErr := c.checkpointService.Save(fmt.Sprintf("After %s", tc.Name))
@@ -726,19 +905,105 @@ func (c *Controller) Chat(ctx context.Context, input ChatRequestInput, callback 
 					log.Printf("📸 Checkpoint saved: %s (after %s)", hash[:8], tc.Name)
 				}
 			}
+
+			// Flag for QC if it's a code modification tool
+			if !isError && (isWriteTool(tc.Name) || tc.Name == "apply_diff") {
+				runQC = true
+			}
 		}
 
-		// Append tool results to session as a User message (standard for Anthropic)
+		// Run Auto-QC if code was modified
+		var qcMessage string
+		if runQC && c.qcManager != nil {
+			log.Printf("🤖 Running Phase 15 Auto-QC...")
+			qcRes, err := c.qcManager.RunCheck(ctx)
+			if err != nil {
+				log.Printf("QC Error: %v", err)
+			} else if !qcRes.Success {
+				log.Printf("❌ Auto-QC FAILED: %s", qcRes.Command)
+				// Create a structured error message to feedback into the loop
+				qcMessage = fmt.Sprintf("\n\n⚠️ **Auto-QC Failed** (Command: `%s`)\n```\n%s\n```\nPlease fix these errors before proceeding.",
+					qcRes.Command, truncateString(qcRes.Output, 2000))
+			} else if qcRes.Output != "" {
+				log.Printf("✅ Auto-QC PASSED: %s", qcRes.Command)
+			}
+		}
+
 		// Append tool results to session as a User message (standard for Anthropic)
 		session.StateHandler.AddMessage(protocol.Message{
 			Role:        "user",
 			ToolResults: toolResults,
+			Content:     qcMessage, // Append QC failure message if any
 		})
 
 		// Loop continues to get AI's reaction to tool results
 	}
 
 	return nil
+}
+
+// sanitizeMessages ensures every tool call has a corresponding result
+func (c *Controller) sanitizeMessages(msgs []protocol.Message) []protocol.Message {
+	if len(msgs) == 0 {
+		return msgs
+	}
+
+	var clean []protocol.Message
+	// We need to look ahead, so we iterate manually
+
+	// Map of ToolCallID -> hasResult
+	// But actually we just need strict pairs: Assistant(ToolUse) -> User(ToolResults)
+	// If Assistant has ToolUse, next msg MUST be User with matching ToolResults
+
+	skipNext := false
+
+	for i := 0; i < len(msgs); i++ {
+		if skipNext {
+			skipNext = false
+			continue
+		}
+
+		msg := msgs[i]
+
+		// If it's a Tool Use message
+		if msg.Role == "assistant" && len(msg.ToolUse) > 0 {
+			// Check next message
+			if i+1 >= len(msgs) {
+				// Dangling tool call at end of history -> Drop it
+				log.Printf("⚠️ Sanitizer: Dropping dangling tool call at end of history (ID: %s)", msg.ToolUse[0].ID)
+				continue
+			}
+
+			nextMsg := msgs[i+1]
+			if nextMsg.Role != "user" || len(nextMsg.ToolResults) == 0 {
+				// Next message is NOT a result -> Drop this tool call
+				log.Printf("⚠️ Sanitizer: Dropping orphaned tool call (ID: %s) followed by %s", msg.ToolUse[0].ID, nextMsg.Role)
+				continue
+			}
+
+			// Optional: Verify IDs match?
+			// DeepSeek expects strict ID matching.
+			// Let's assume if it follows, it's correct enough for now.
+			// But if we want to be safe, we should check.
+
+			// Keep both
+			clean = append(clean, msg)
+			clean = append(clean, nextMsg)
+			skipNext = true // Consumed nextMsg
+			continue
+		}
+
+		// Determine if this is an orphan Tool Result (User message with results but no preceding call)
+		// Since we handle pairs above, if we see a User with Results here, it means we skipped the call!
+		if msg.Role == "user" && len(msg.ToolResults) > 0 {
+			log.Printf("⚠️ Sanitizer: Dropping orphan tool result (ID: %s)", msg.ToolResults[0].ToolUseID)
+			continue
+		}
+
+		clean = append(clean, msg)
+	}
+
+	return clean
 }
 
 // GetState returns the current state for a session

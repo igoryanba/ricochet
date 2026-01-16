@@ -1,8 +1,9 @@
 import { useState, useMemo, useEffect, useRef } from 'react';
-import { ChevronDown, ChevronRight, ChevronUp, Search, FileText, Edit3, Terminal, RotateCcw } from 'lucide-react';
-import { ChatMessage as ChatMessageType, ToolCall, ActivityItem } from '@hooks/useChat';
+import { ChevronDown, ChevronRight, ChevronUp, FileText, Edit3, Terminal, RotateCcw } from 'lucide-react';
+import { ChatMessage as ChatMessageType, ToolCall, ActivityItem, TaskProgress } from '@hooks/useChat';
 import { useVSCodeApi } from '@hooks/useVSCodeApi';
 import { DiffView, parseDiff } from '../diff/DiffView';
+import { TaskProgressCard } from './TaskProgressCard';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
@@ -10,46 +11,29 @@ import { vscDarkPlus } from 'react-syntax-highlighter/dist/esm/styles/prism';
 
 interface ChatMessageProps {
     message: ChatMessageType;
+    taskProgress?: TaskProgress | null;
     onExecuteCommand?: (command: string) => void;
     onRestore?: (hash: string) => void;
 }
 
-const PROGRESS_STYLE = `
-@keyframes fadeIn {
-    from { opacity: 0; transform: translateY(4px); }
-    to { opacity: 1; transform: translateY(0); }
-}
-.animate-fade-in {
-    animation: fadeIn 0.4s cubic-bezier(0.4, 0, 0.2, 1) forwards;
-}
-`;
+
 
 /**
  * Chat message message component with markdown rendering.
  * Matches competitor styling with code blocks and reasoning sections.
  */
-export function ChatMessage({ message, onExecuteCommand, onRestore }: ChatMessageProps) {
+export function ChatMessage({ message, taskProgress, onExecuteCommand, onRestore }: ChatMessageProps) {
     const isUser = message.role === 'user';
 
     return (
         <div className={`py-4 px-2 transition-colors ${!isUser ? 'bg-vscode-sideBar-background/30' : ''}`}>
-            <style>{PROGRESS_STYLE}</style>
             {!isUser ? (
-                <div className="flex flex-col gap-1 px-4">
+                <div className="px-4 animate-fade-in">
                     <div className="flex items-center gap-2 mb-1 pl-1 opacity-50 hover:opacity-100 transition-opacity">
-                        <div className="text-[9px] font-bold text-ricochet-primary/60 uppercase tracking-widest bg-ricochet-primary/5 px-1.5 py-0.5 rounded border border-ricochet-primary/10">
-                            AGENT
-                        </div>
-                        {message.via && message.via !== 'ide' && (
-                            <span className="text-[9px] font-medium text-blue-400/80 uppercase tracking-widest flex items-center gap-1.5 opacity-80" title={`via ${message.via}`}>
-                                <span className="w-1.5 h-1.5 rounded-full bg-blue-400 animate-pulse shadow-[0_0_8px_rgba(96,165,250,0.5)]" />
-                                {message.via === 'telegram' ? 'TELEGRAM' : message.via === 'discord' ? 'DISCORD' : message.via}
-                            </span>
-                        )}
                         {message.checkpointHash && onRestore && (
                             <button
                                 onClick={() => onRestore(message.checkpointHash!)}
-                                className="ml-auto text-[9px] font-medium text-white/40 hover:text-white/70 uppercase tracking-widest flex items-center gap-1 transition-colors bg-white/5 px-2 py-0.5 rounded hover:bg-white/10"
+                                className="flex items-center gap-1.5 px-2 py-1 rounded-md bg-white/5 hover:bg-white/10 border border-white/5 text-[9px] font-medium text-white/50 hover:text-white/80 uppercase tracking-wider transition-all backdrop-blur-sm"
                                 title={`Restore workspace to checkpoint ${message.checkpointHash.slice(0, 8)}`}
                             >
                                 <RotateCcw className="w-3 h-3" />
@@ -57,9 +41,7 @@ export function ChatMessage({ message, onExecuteCommand, onRestore }: ChatMessag
                             </button>
                         )}
                     </div>
-                    <div className="animate-fade-in">
-                        <AssistantContent message={message} onExecuteCommand={onExecuteCommand} />
-                    </div>
+                    <AssistantContent message={message} taskProgress={taskProgress} onExecuteCommand={onExecuteCommand} />
                 </div>
             ) : (
                 <UserContent content={message.content} via={message.via} remoteUsername={message.remoteUsername} />
@@ -69,10 +51,13 @@ export function ChatMessage({ message, onExecuteCommand, onRestore }: ChatMessag
 }
 
 const UserContent = ({ content, via, remoteUsername }: { content: string; via?: 'telegram' | 'discord' | 'ide'; remoteUsername?: string }) => {
+    // Don't show username if it's just the same as the via badge (e.g. "Telegram")
+    const isRedundantName = remoteUsername && via && remoteUsername.toLowerCase() === via.toLowerCase();
+
     return (
         <div className="flex flex-col items-end w-full px-4 mb-2">
             <div className="flex items-center gap-2 mb-1 px-1">
-                {remoteUsername && (
+                {!isRedundantName && remoteUsername && (
                     <span className="text-[10px] text-vscode-fg/40 font-medium">{remoteUsername}</span>
                 )}
                 {via && via !== 'ide' && (
@@ -82,31 +67,49 @@ const UserContent = ({ content, via, remoteUsername }: { content: string; via?: 
                 )}
             </div>
             <div
-                className="max-w-[90%] py-2.5 px-4 rounded-2xl rounded-tr-sm whitespace-pre-wrap text-[14px] font-medium leading-relaxed border border-white/5 shadow-sm"
+                className="max-w-[90%] py-2.5 px-4 rounded-2xl rounded-tr-sm whitespace-pre-wrap text-[12px] font-medium leading-relaxed border border-white/10 shadow-lg backdrop-blur-md relative overflow-hidden"
                 style={{
-                    backgroundColor: 'rgba(255, 255, 255, 0.05)',
+                    backgroundColor: 'rgba(255, 255, 255, 0.08)',
                     color: '#ffffff',
                 }}
             >
+                {/* Glossy gradient overlay */}
+                <div className="absolute inset-0 bg-gradient-to-br from-white/10 to-transparent opacity-30 pointer-events-none" />
                 {content}
             </div>
         </div>
     );
 };
 
-function AssistantContent({ message, onExecuteCommand }: { message: ChatMessageType; onExecuteCommand?: (cmd: string) => void }) {
-    const { thinking, body, isPlan } = useMemo(() => parseContent(message.content), [message.content]);
+function AssistantContent({ message, taskProgress, onExecuteCommand }: {
+    message: ChatMessageType;
+    taskProgress?: TaskProgress | null;
+    onExecuteCommand?: (cmd: string) => void
+}) {
+    const { thinking, body, isPlan, planPath } = useMemo(() => parseContent(message.content), [message.content]);
 
     return (
-        <div className="text-[14px]">
-            {((message.activities && message.activities.length > 0) || (message.toolCalls && message.toolCalls.length > 0)) && (
-                <ProgressBlock activities={message.activities || []} toolCalls={message.toolCalls || []} />
+        <div className="text-[12px]">
+            {/* Task Progress Card - Antigravity-style structured progress */}
+            {taskProgress && (
+                <TaskProgressCard
+                    taskName={taskProgress.task_name}
+                    summary={taskProgress.summary || ''}
+                    mode={taskProgress.mode || 'execution'}
+                    steps={taskProgress.steps}
+                    filesEdited={taskProgress.files}
+                    isActive={taskProgress.is_active}
+                />
             )}
 
             {thinking && <ReasoningBlock content={thinking} isStreaming={message.isStreaming} />}
 
+            {((message.activities && message.activities.length > 0) || (message.toolCalls && message.toolCalls.length > 0)) && (
+                <ProgressBlock activities={message.activities || []} toolCalls={message.toolCalls || []} />
+            )}
+
             {isPlan && (
-                <ImplementationPlanCard />
+                <ImplementationPlanCard file={planPath} />
             )}
 
             <div className="text-vscode-fg leading-relaxed mt-2 overflow-hidden max-w-none space-y-2">
@@ -128,54 +131,56 @@ function AssistantContent({ message, onExecuteCommand }: { message: ChatMessageT
  * Matches competitor styling without external dependencies.
  */
 function MarkdownContent({ content, onExecuteCommand }: { content: string; onExecuteCommand?: (cmd: string) => void }) {
+    const components = useMemo(() => ({
+        code({ node, inline, className, children, ...props }: any) {
+            const match = /language-(\w+)/.exec(className || '');
+            const code = String(children).replace(/\n$/, '');
+
+            if (!inline) {
+                return (
+                    <CodeBlock
+                        language={match ? match[1] : 'text'}
+                        code={code}
+                        onExecuteCommand={onExecuteCommand}
+                    />
+                );
+            }
+
+            return (
+                <code
+                    className="px-1.5 py-0.5 rounded text-[12px] bg-vscode-textCodeBlock-background text-vscode-textPreformat-foreground font-mono border border-white/5"
+                    {...props}
+                >
+                    {children}
+                </code>
+            );
+        },
+        p: ({ children }: any) => <p className="mb-3 last:mb-0 leading-relaxed text-[13.5px]">{children}</p>,
+        ul: ({ children }: any) => <ul className="list-disc ml-4 mb-3 space-y-1">{children}</ul>,
+        ol: ({ children }: any) => <ol className="list-decimal ml-4 mb-3 space-y-1">{children}</ol>,
+        li: ({ children }: any) => (
+            <li className="leading-relaxed text-[13.5px] opacity-90 pl-1 mb-1">
+                <div className="inline-block align-top">{children}</div>
+            </li>
+        ),
+        h1: ({ children }: any) => <h1 className="text-[17px] font-bold mb-3 mt-5 text-white/90 border-b border-white/5 pb-1">{children}</h1>,
+        h2: ({ children }: any) => <h2 className="text-[15px] font-bold mb-2 mt-4 text-white/90">{children}</h2>,
+        h3: ({ children }: any) => <h3 className="text-[13px] font-bold mb-2 mt-3 text-white/80">{children}</h3>,
+        strong: ({ children }: any) => <strong className="font-bold text-white/95">{children}</strong>,
+        a: ({ node, ...props }: any) => (
+            <a className="text-ricochet-primary/90 hover:text-ricochet-primary hover:underline transition-colors" {...props} target="_blank" rel="noopener noreferrer" />
+        ),
+        blockquote: ({ children }: any) => (
+            <blockquote className="border-l-2 border-white/10 pl-4 py-1 my-3 italic text-vscode-fg/60 bg-white/[0.02] rounded-r">
+                {children}
+            </blockquote>
+        ),
+    }), [onExecuteCommand]);
+
     return (
         <ReactMarkdown
             remarkPlugins={[remarkGfm]}
-            components={{
-                code({ node, inline, className, children, ...props }: any) {
-                    const match = /language-(\w+)/.exec(className || '');
-                    const code = String(children).replace(/\n$/, '');
-
-                    if (!inline) {
-                        return (
-                            <CodeBlock
-                                language={match ? match[1] : 'text'}
-                                code={code}
-                                onExecuteCommand={onExecuteCommand}
-                            />
-                        );
-                    }
-
-                    return (
-                        <code
-                            className="px-1.5 py-0.5 rounded text-[12px] bg-vscode-textCodeBlock-background text-vscode-textPreformat-foreground font-mono border border-white/5"
-                            {...props}
-                        >
-                            {children}
-                        </code>
-                    );
-                },
-                p: ({ children }) => <p className="mb-3 last:mb-0 leading-relaxed text-[13.5px]">{children}</p>,
-                ul: ({ children }) => <ul className="list-disc ml-4 mb-3 space-y-1">{children}</ul>,
-                ol: ({ children }) => <ol className="list-decimal ml-4 mb-3 space-y-1">{children}</ol>,
-                li: ({ children }) => (
-                    <li className="leading-relaxed text-[13.5px] opacity-90 pl-1 mb-1">
-                        <div className="inline-block align-top">{children}</div>
-                    </li>
-                ),
-                h1: ({ children }) => <h1 className="text-[17px] font-bold mb-3 mt-5 text-white/90 border-b border-white/5 pb-1">{children}</h1>,
-                h2: ({ children }) => <h2 className="text-[15px] font-bold mb-2 mt-4 text-white/90">{children}</h2>,
-                h3: ({ children }) => <h3 className="text-[13px] font-bold mb-2 mt-3 text-white/80">{children}</h3>,
-                strong: ({ children }) => <strong className="font-bold text-white/95">{children}</strong>,
-                a: ({ node, ...props }) => (
-                    <a className="text-ricochet-primary/90 hover:text-ricochet-primary hover:underline transition-colors" {...props} target="_blank" rel="noopener noreferrer" />
-                ),
-                blockquote: ({ children }) => (
-                    <blockquote className="border-l-2 border-white/10 pl-4 py-1 my-3 italic text-vscode-fg/60 bg-white/[0.02] rounded-r">
-                        {children}
-                    </blockquote>
-                ),
-            }}
+            components={components}
         >
             {content}
         </ReactMarkdown>
@@ -222,7 +227,7 @@ function CodeBlock({ language, code, onExecuteCommand }: { language: string; cod
     }
 
     return (
-        <div className={`rounded-md overflow-hidden border border-white/5 my-2 ${isTerminal ? 'bg-black/40' : 'bg-[#2d2d2d]/30'}`}>
+        <div className={`rounded-xl overflow-hidden border border-white/10 my-3 shadow-sm backdrop-blur-sm ${isTerminal ? 'bg-black/60' : 'bg-[#1e1e1e]/40'}`}>
             {/* Header */}
             <div
                 className="flex items-center justify-between px-3 py-1.5 bg-vscode-sideBar-background cursor-pointer group"
@@ -319,55 +324,63 @@ function ReasoningBlock({ content, isStreaming }: { content: string; isStreaming
         }
     }, [isStreaming]);
 
+    // Format elapsed time as "Xs" or "Xm Ys"
+    const formatTime = (seconds: number) => {
+        if (seconds < 60) return `${seconds}s`;
+        const mins = Math.floor(seconds / 60);
+        const secs = seconds % 60;
+        return `${mins}m ${secs}s`;
+    };
+
+    // Highlight backtick-wrapped references (files, tools) with gray background
+    const renderContent = (text: string) => {
+        const parts = text.split(/(`[^`]+`)/g);
+        return parts.map((part, i) => {
+            if (part.startsWith('`') && part.endsWith('`')) {
+                const code = part.slice(1, -1);
+                return (
+                    <span key={i} className="px-1 py-0.5 bg-white/5 rounded text-vscode-fg/60 font-mono text-[11px]">
+                        {code}
+                    </span>
+                );
+            }
+            return <span key={i}>{part}</span>;
+        });
+    };
+
     return (
-        <div className="mb-4 bg-vscode-textCodeBlock-background/20 rounded-lg p-1">
+        <div className="mb-3">
             <button
                 onClick={() => setIsExpanded(!isExpanded)}
-                className="w-full flex items-center gap-2 py-2 px-3 hover:bg-white/[0.03] rounded-lg transition-all group border border-white/[0.02] hover:border-white/5"
+                className="w-full flex items-center gap-2 py-1 hover:opacity-70 transition-opacity group"
             >
-                <div className="w-2 h-2 rounded-full bg-ricochet-primary/40 animate-pulse mr-1" />
-                <span className="text-[10px] font-black uppercase tracking-[0.15em] text-vscode-fg/40 flex items-center gap-2">
-                    THOUGHT PROCESS
-                    {elapsed > 0 && <span className="font-mono opacity-30 tracking-normal">[{elapsed}s]</span>}
+                <span className="text-[11px] text-vscode-fg/40 font-medium">
+                    Thought for {formatTime(elapsed)}
                 </span>
-                {isStreaming && (
-                    <span className="mx-2 flex gap-1">
-                        <span className="w-1 h-1 bg-ricochet-primary/60 rounded-full animate-bounce [animation-delay:-0.3s]" />
-                        <span className="w-1 h-1 bg-ricochet-primary/60 rounded-full animate-bounce [animation-delay:-0.15s]" />
-                        <span className="w-1 h-1 bg-ricochet-primary/60 rounded-full animate-bounce" />
-                    </span>
-                )}
                 <div className="flex-1" />
                 {isExpanded ? (
-                    <ChevronDown className="w-3.5 h-3.5 text-vscode-fg/30 group-hover:text-vscode-fg/50 transition-colors" />
+                    <ChevronDown className="w-3 h-3 text-vscode-fg/30" />
                 ) : (
-                    <ChevronRight className="w-3.5 h-3.5 text-vscode-fg/30 group-hover:text-vscode-fg/50 transition-colors" />
+                    <ChevronRight className="w-3 h-3 text-vscode-fg/30" />
                 )}
             </button>
             {isExpanded && (
-                <div className="px-5 py-3 mt-1 text-[13px] text-vscode-fg/70 italic whitespace-pre-wrap leading-relaxed border-l-2 border-ricochet-primary/30 ml-3 mb-2 bg-black/10 rounded-r-lg">
-                    {content.trim()}
+                <div className="mt-2 text-[12px] text-vscode-fg/50 whitespace-pre-wrap leading-relaxed">
+                    {renderContent(content.trim())}
                 </div>
             )}
         </div>
     );
 }
 
-function ProgressBlock({ activities, toolCalls }: { activities: ActivityItem[]; toolCalls: ToolCall[] }) {
-    const { postMessage } = useVSCodeApi();
-    const [isExpanded, setIsExpanded] = useState(true);
 
-    const getActivityIcon = (type: ActivityItem['type']) => {
-        switch (type) {
-            case 'search': return <Search className="w-3 h-3" />;
-            case 'analyze': return <FileText className="w-3 h-3" />;
-            case 'edit': return <Edit3 className="w-3 h-3" />;
-            case 'command': return <Terminal className="w-3 h-3" />;
-        }
-    };
+function ProgressBlock({ activities, toolCalls }: { activities: ActivityItem[]; toolCalls: ToolCall[] }) {
+    const [isExpanded, setIsExpanded] = useState(true);
+    const { postMessage } = useVSCodeApi();
 
     const getActivityLabel = (activity: ActivityItem) => {
         const fileName = activity.file?.split('/').pop() || activity.file;
+
         switch (activity.type) {
             case 'search':
                 return (
@@ -411,82 +424,9 @@ function ProgressBlock({ activities, toolCalls }: { activities: ActivityItem[]; 
                     </div>
                 );
             case 'command':
-                return <span className="text-vscode-fg/50">Ran command</span>;
+                return <span className="text-vscode-fg/50 mb-0.5">Ran command</span>;
         }
     };
-
-    const getToolInfo = (name: string) => {
-        const n = name.toLowerCase();
-        if (n.includes('read') || n.includes('view_file')) return { label: 'READ', color: 'text-blue-400' };
-        if (n.includes('edit') || n.includes('write')) return { label: 'EDIT', color: 'text-green-400' };
-        if (n.includes('search') || n.includes('grep')) return { label: 'FIND', color: 'text-yellow-400' };
-        if (n.includes('run') || n.includes('exec') || n.includes('command')) return { label: 'CMD', color: 'text-purple-400' };
-        if (n.includes('list') || n.includes('ls')) return { label: 'LIST', color: 'text-gray-400' };
-        return { label: 'TOOL', color: 'text-vscode-fg/30' };
-    };
-
-    const getToolRow = (tool: ToolCall) => {
-        const info = getToolInfo(tool.name);
-        let path: string | undefined;
-        try {
-            // tool.arguments is a stringified JSON
-            const args = typeof tool.arguments === 'string' ? JSON.parse(tool.arguments) : tool.arguments;
-            path = args.path || args.TargetFile || args.AbsolutePath || args.file || args.TargetContent;
-        } catch (e) { }
-
-        const fileName = (typeof path === 'string' && path.includes('/') ? path.split('/').pop() : path) || null;
-
-        return (
-            <div className="flex items-center gap-2 overflow-hidden flex-1 group/tool">
-                <span className={`text-[8px] font-bold ${info.color} opacity-60 w-8 text-right flex-shrink-0 group-hover/tool:opacity-100 transition-opacity`}>{info.label}</span>
-                <span className="truncate opacity-50 font-mono text-[9px] group-hover/tool:opacity-80 transition-opacity" title={tool.name}>{tool.name}</span>
-                {fileName && typeof fileName === 'string' && (
-                    <button
-                        className="text-[9px] text-blue-400 hover:text-blue-300 hover:underline px-0.5 py-0.5 truncate transition-all flex items-center gap-1"
-                        onClick={(e) => {
-                            e.stopPropagation();
-                            if (typeof path === 'string') {
-                                postMessage({ type: 'open_file', payload: { path: path.split('#')[0] } });
-                            }
-                        }}
-                    >
-                        <FileText className="w-2.5 h-2.5 opacity-50" />
-                        {fileName}
-                    </button>
-                )}
-                {tool.status === 'running' && <span className="w-1.5 h-1.5 rounded-full bg-blue-500 animate-pulse ml-auto mr-1" />}
-                {tool.status === 'completed' && (
-                    <div className="flex items-center gap-1 ml-auto mr-1">
-                        {(tool.name === 'write_to_file' || tool.name === 'replace_file_content') && (
-                            <button
-                                className="p-1 hover:bg-white/10 rounded transition-colors text-vscode-fg/40 hover:text-green-400"
-                                title="View Diff in VSCode"
-                                onClick={(e) => {
-                                    e.stopPropagation();
-                                    const args = typeof tool.arguments === 'string' ? JSON.parse(tool.arguments) : tool.arguments;
-                                    postMessage({
-                                        type: 'show_native_diff',
-                                        payload: {
-                                            path: args.TargetFile,
-                                            newContent: args.CodeContent || args.ReplacementContent,
-                                            targetContent: args.TargetContent
-                                        }
-                                    });
-                                }}
-                            >
-                                <Edit3 className="w-3 h-3" />
-                            </button>
-                        )}
-                        <div className="w-1 h-1 rounded-full bg-green-500/30" />
-                    </div>
-                )}
-            </div>
-        );
-    };
-
-    // Consolidate list for rendering
-
-    // Consolidate list for rendering
 
     if (!isExpanded) {
         return (
@@ -504,39 +444,367 @@ function ProgressBlock({ activities, toolCalls }: { activities: ActivityItem[]; 
     return (
         <div className="mb-4 overflow-hidden animate-fade-in max-w-full">
             <div className="flex flex-col gap-1.5 relative pl-3 before:content-[''] before:absolute before:left-0 before:top-2 before:bottom-2 before:w-[1px] before:bg-white/5">
-                {/* Render Activities First (High Level) */}
+                {/* Render Activities for high-level summary */}
                 {activities.map((activity, i) => (
                     <div key={`act-${i}`} className="flex items-center gap-2 text-[11px] text-vscode-fg/60 hover:text-vscode-fg/80 transition-opacity">
-                        <span className="text-vscode-fg/20 flex-shrink-0">{getActivityIcon(activity.type)}</span>
                         <div className="flex-1 min-w-0">{getActivityLabel(activity)}</div>
                     </div>
                 ))}
 
-                {/* Render Tool Calls (Trace) - Only if notable or no activities */}
-                {(activities.length === 0 || toolCalls.length > activities.length) && (
-                    <div className="flex flex-col gap-0.5 mt-1 opacity-40 hover:opacity-100 transition-opacity">
-                        {toolCalls.map((tool, i) => {
-                            // Basic heuristic: if it's update_todos, it's internal noise
-                            if (tool.name === 'update_todos') return null;
-                            return (
-                                <div key={`tool-${i}`} className="flex items-center gap-2 text-[9px] font-mono whitespace-nowrap overflow-hidden">
-                                    <span className="w-1 h-1 rounded-full bg-vscode-fg/20" />
-                                    {getToolRow(tool)}
-                                </div>
-                            );
-                        })}
-                    </div>
-                )}
+                {/* Render Tool Calls (Detailed Trace) */}
+                <div className="flex flex-col gap-0.5 mt-1 opacity-100 transition-opacity">
+                    {toolCalls.map((tool, i) => {
+                        if (tool.name === 'update_todos') return null;
+                        return <ToolRow key={`tool-${i}`} tool={tool} />;
+                    })}
+                </div>
             </div>
         </div>
     );
 }
 
-function ImplementationPlanCard() {
+import { DiffLine, FileDiff } from '../diff/DiffView';
+
+function ToolRow({ tool }: { tool: ToolCall }) {
     const { postMessage } = useVSCodeApi();
 
+    // Determine if this is an edit tool early for default expansion
+    const isEditTool = tool.name === 'replace_file_content' || tool.name === 'write_to_file' || tool.name === 'write_file';
+
+    // Auto-expand diff for completed edit tools (Kilo Code style)
+    const [showDiff, setShowDiff] = useState(isEditTool && tool.status === 'completed');
+    const [showDropdown, setShowDropdown] = useState(false);
+
+    const getToolInfo = (name: string) => {
+        const n = name.toLowerCase();
+        if (n.includes('read') || n.includes('view_file')) return { label: 'READ', color: 'text-blue-400' };
+        if (n.includes('edit') || n.includes('write') || n.includes('replace')) return { label: 'EDIT', color: 'text-green-400' };
+        if (n.includes('search') || n.includes('grep')) return { label: 'FIND', color: 'text-yellow-400' };
+        if (n.includes('run') || n.includes('exec') || n.includes('command')) return { label: 'CMD', color: 'text-purple-400' };
+        if (n.includes('list') || n.includes('ls')) return { label: 'LIST', color: 'text-gray-400' };
+        return { label: 'TOOL', color: 'text-vscode-fg/30' };
+    };
+
+    const info = getToolInfo(tool.name);
+    let path: string | undefined;
+    let args: any = {};
+    try {
+        args = typeof tool.arguments === 'string' ? JSON.parse(tool.arguments) : tool.arguments;
+        path = args.path || args.TargetFile || args.AbsolutePath || args.file || args.TargetContent;
+    } catch (e) { }
+
+    const fileName = (typeof path === 'string' && path.includes('/') ? path.split('/').pop() : path) || null;
+    const diff = isEditTool ? getToolDiff(tool, args) : null;
+
+    // Kilo Code style: prominent edit header
+    if (isEditTool && diff) {
+        const isOverwrite = tool.name === 'write_to_file' || tool.name === 'write_file';
+        const headerText = isOverwrite ? 'Ricochet wants to overwrite this file' : 'Ricochet wants to edit this file';
+
+        return (
+            <div className="flex flex-col gap-1 my-2">
+                {/* Kilo Code style header */}
+                <button
+                    onClick={() => setShowDiff(!showDiff)}
+                    className="flex items-center gap-2 px-3 py-2 bg-[#252526] hover:bg-[#2a2d2e] rounded-lg border border-[#333] transition-colors"
+                >
+                    <Edit3 className={`w-4 h-4 ${isOverwrite ? 'text-red-400' : 'text-green-400'}`} />
+                    <span className="text-xs font-medium text-[#ccc]">
+                        {headerText}
+                    </span>
+                    <span className="ml-auto flex items-center gap-2">
+                        {diff && (
+                            <span className="text-[10px] text-vscode-fg/50">
+                                <span className="text-green-400">+{diff.hunks.flat().filter(l => l.type === 'add').length}</span>
+                                {' '}
+                                <span className="text-red-400">-{diff.hunks.flat().filter(l => l.type === 'remove').length}</span>
+                            </span>
+                        )}
+                        {showDiff ? <ChevronUp className="w-4 h-4 text-vscode-fg/50" /> : <ChevronDown className="w-4 h-4 text-vscode-fg/50" />}
+                    </span>
+                </button>
+
+                {/* File name row */}
+                <div className="flex items-center gap-2 px-3 py-1.5 bg-[#1e1e1e] rounded-lg border border-[#333]">
+                    <FileText className="w-3.5 h-3.5 text-blue-400" />
+                    <button
+                        className="text-xs text-blue-400 hover:text-blue-300 hover:underline font-mono truncate"
+                        onClick={() => {
+                            if (typeof path === 'string') {
+                                postMessage({ type: 'open_file', payload: { path: path.split('#')[0] } });
+                            }
+                        }}
+                    >
+                        {fileName || path}
+                    </button>
+                    {tool.status === 'running' && <span className="w-2 h-2 rounded-full bg-blue-500 animate-pulse ml-auto" />}
+                    {tool.status === 'completed' && <span className="w-2 h-2 rounded-full bg-green-500 ml-auto" title="Applied" />}
+                </div>
+
+                {/* Diff content */}
+                {showDiff && (
+                    <div className="animate-fade-in">
+                        <DiffView
+                            diffs={[diff]}
+                            onApprove={tool.status === 'completed' ? undefined : () => {
+                                // Collapse diff after approval
+                                setShowDiff(false);
+                            }}
+                            onReject={tool.status === 'completed' ? undefined : () => {
+                                // Collapse diff after rejection
+                                setShowDiff(false);
+                            }}
+                            onViewInVSCode={(p) => postMessage({ type: 'open_file', payload: { path: p } })}
+                        />
+                    </div>
+                )}
+            </div>
+        );
+    }
+
+    // Antigravity style: Terminal block for commands
+    const isCommandTool = tool.name === 'run_command' || tool.name === 'execute_command' || tool.name.includes('command');
+    const command = args.command || args.CommandLine || args.cmd;
+
+    if (isCommandTool && command) {
+        // Using showDiff state from component level (no useState here!)
+        const output = tool.result || '';
+        const exitCode = args.exitCode ?? (tool.status === 'completed' ? 0 : null);
+        const hasOutput = output && output.trim().length > 0;
+
+        return (
+            <div className="my-2 rounded-lg border border-[#333] bg-[#0d1117]">
+                {/* Terminal Header - clickable to expand output */}
+                <button
+                    onClick={() => hasOutput && setShowDiff(!showDiff)}
+                    className={`w-full flex items-center gap-2 px-3 py-2 bg-[#161b22] rounded-t-lg transition-colors ${hasOutput ? 'hover:bg-[#1c2128] cursor-pointer' : 'cursor-default'} ${!hasOutput ? 'rounded-b-lg' : 'border-b border-[#333]'}`}
+                >
+                    <Terminal className="w-3.5 h-3.5 text-purple-400" />
+                    <span className="text-[10px] text-[#8b949e] font-mono">$</span>
+                    <code className="text-xs text-[#c9d1d9] font-mono flex-1 truncate text-left" title={command}>
+                        {command.length > 60 ? command.slice(0, 60) + '...' : command}
+                    </code>
+                    {tool.status === 'running' && (
+                        <span className="w-2 h-2 rounded-full bg-yellow-500 animate-pulse" />
+                    )}
+                    {tool.status === 'completed' && (
+                        <span className={`text-[10px] font-mono ${exitCode === 0 ? 'text-green-400' : 'text-red-400'}`}>
+                            Exit {exitCode}
+                        </span>
+                    )}
+                    {hasOutput && (
+                        showDiff ?
+                            <ChevronUp className="w-3.5 h-3.5 text-[#8b949e]" /> :
+                            <ChevronDown className="w-3.5 h-3.5 text-[#8b949e]" />
+                    )}
+                </button>
+
+                {/* Terminal Output - plain text, no syntax highlighting */}
+                {showDiff && hasOutput && (
+                    <div className="px-3 py-2 max-h-40 overflow-auto bg-[#0d1117]">
+                        <pre className="text-[11px] font-mono text-[#8b949e] whitespace-pre-wrap break-all">
+                            {output}
+                        </pre>
+                    </div>
+                )}
+
+                {/* Terminal Footer with Always Proceed dropdown - always visible */}
+                {hasOutput && (
+                    <div className="flex items-center justify-between px-3 py-1.5 bg-[#161b22] border-t border-[#333] rounded-b-lg relative">
+                        <span className="text-[10px] text-[#484f58] font-mono">
+                            Ran terminal command
+                        </span>
+                        <div className="relative">
+                            <button
+                                onClick={(e) => { e.stopPropagation(); setShowDropdown(!showDropdown); }}
+                                className="flex items-center gap-1 px-2 py-1 text-[10px] text-[#8b949e] hover:text-white hover:bg-white/10 rounded transition-colors"
+                            >
+                                Always Proceed
+                                <ChevronDown className="w-3 h-3" />
+                            </button>
+                            {showDropdown && (
+                                <>
+                                    {/* Backdrop to close */}
+                                    <div
+                                        className="fixed inset-0 z-[9998]"
+                                        onClick={() => setShowDropdown(false)}
+                                    />
+                                    {/* Dropdown menu - positioned above with high z-index */}
+                                    <div className="absolute right-0 bottom-full mb-1 w-48 bg-[#1c2128] border border-[#333] rounded-lg shadow-2xl z-[9999] overflow-hidden">
+                                        <button
+                                            onClick={() => {
+                                                setShowDropdown(false);
+                                                postMessage({ type: 'set_auto_approve', payload: { commands: false } });
+                                            }}
+                                            className="w-full px-3 py-2 text-left text-xs text-[#c9d1d9] hover:bg-[#30363d] flex flex-col"
+                                        >
+                                            <span className="font-medium">Request Review</span>
+                                            <span className="text-[10px] text-[#8b949e]">Always ask for permission</span>
+                                        </button>
+                                        <button
+                                            onClick={() => {
+                                                setShowDropdown(false);
+                                                postMessage({ type: 'set_auto_approve', payload: { commands: true } });
+                                            }}
+                                            className="w-full px-3 py-2 text-left text-xs text-[#c9d1d9] hover:bg-[#30363d] flex flex-col"
+                                        >
+                                            <span className="font-medium">Always Proceed</span>
+                                            <span className="text-[10px] text-[#8b949e]">Always run terminal commands</span>
+                                        </button>
+                                    </div>
+                                </>
+                            )}
+                        </div>
+                    </div>
+                )}
+            </div>
+        );
+    }
+
+    // Regular tool row for non-edit, non-command tools
     return (
-        <div className="my-4 p-4 bg-vscode-editor-background border border-ricochet-primary/20 rounded-lg shadow-sm space-y-4">
+        <div className="flex flex-col gap-1 group/tool">
+            <div className="flex items-center gap-2 text-[9px] font-mono whitespace-nowrap overflow-hidden">
+                <span className="w-1 h-1 rounded-full bg-vscode-fg/20" />
+                <span className={`text-[8px] font-bold ${info.color} opacity-60 w-8 text-right flex-shrink-0 group-hover/tool:opacity-100 transition-opacity`}>{info.label}</span>
+                <span className="truncate opacity-50 font-mono text-[9px] group-hover/tool:opacity-80 transition-opacity" title={tool.name}>{tool.name}</span>
+                {fileName && typeof fileName === 'string' && (
+                    <button
+                        className="text-[9px] text-blue-400 hover:text-blue-300 hover:underline px-0.5 py-0.5 truncate transition-all flex items-center gap-1"
+                        onClick={(e) => {
+                            e.stopPropagation();
+                            if (typeof path === 'string') {
+                                postMessage({ type: 'open_file', payload: { path: path.split('#')[0] } });
+                            }
+                        }}
+                    >
+                        <FileText className="w-2.5 h-2.5 opacity-50" />
+                        {fileName}
+                    </button>
+                )}
+                {tool.status === 'running' && <span className="w-1.5 h-1.5 rounded-full bg-blue-500 animate-pulse ml-auto mr-1" />}
+                {tool.status === 'completed' && <div className="w-1 h-1 rounded-full bg-green-500/30 ml-auto mr-1" />}
+            </div>
+        </div>
+    );
+}
+
+function getToolDiff(tool: ToolCall, args: any): FileDiff | null {
+    if (tool.name === 'replace_file_content') {
+        if (!args.TargetContent || !args.ReplacementContent) return null;
+
+        // Naive diff generation
+        const targetLines = args.TargetContent.split('\n');
+        const replacementLines = args.ReplacementContent.split('\n');
+        const startLine = args.StartLine || 1;
+
+        const hunks: DiffLine[] = [
+            ...targetLines.map((l: string, i: number) => ({ type: 'remove' as const, content: l, lineNumber: startLine + i })),
+            ...replacementLines.map((l: string, i: number) => ({ type: 'add' as const, content: l, lineNumber: startLine + i })) // Line numbers for adds are approximate here
+        ];
+
+        return {
+            path: args.TargetFile,
+            operation: 'modify',
+            hunks: [hunks]
+        };
+    }
+
+    if (tool.name === 'write_to_file' || tool.name === 'write_file') {
+        // Support both write_to_file and write_file tools
+        const content = args.CodeContent || args.content;
+        const filePath = args.TargetFile || args.path;
+        if (!content) return null;
+        return {
+            path: filePath,
+            operation: args.Overwrite ? 'modify' : 'create',
+            hunks: [[
+                ...content.split('\n').map((l: string, i: number) => ({ type: 'add' as const, content: l, lineNumber: i + 1 }))
+            ]]
+        };
+    }
+    return null;
+}
+
+
+
+
+
+function parseContent(content: string) {
+    let thinking = "";
+    let body = "";
+    let lastIndex = 0;
+
+    // Regular expression for <thinking> blocks (handles open/streaming ones too)
+    // Supports both <thinking> and <think> (DeepSeek style)
+    const thinkingRegex = /<(?:thinking|think)>([\s\S]*?)(?:<\/(?:thinking|think)>|$)/g;
+    let match;
+
+    while ((match = thinkingRegex.exec(content)) !== null) {
+        // Append prefix text to body
+        body += content.substring(lastIndex, match.index);
+
+        // Append thinking content
+        const blockContent = match[1].trim();
+        if (blockContent) {
+            thinking += (thinking ? "\n\n" : "") + blockContent;
+        }
+
+        // Update lastIndex to end of match
+        lastIndex = match.index + match[0].length;
+
+        // Check if this block is unclosed (streaming)
+        // If it doesn't end with a generic closing tag, it's the last one
+        const isClosed = match[0].endsWith('</thinking>') || match[0].endsWith('</think>');
+        if (!isClosed) break;
+    }
+
+    // Append remaining text
+    body += content.substring(lastIndex);
+
+    // Check for "start_task" output pattern
+    // e.g. "✅ Task Workspace created at `.agent/tasks/refactor_auth/`."
+    const taskMatch = content.match(/Task Workspace created at `(.+?)`/);
+    let planPath: string | undefined;
+    let isPlan = false;
+
+    if (taskMatch) {
+        // Construct path to PLAN.md
+        const basePath = taskMatch[1];
+        planPath = basePath.endsWith('/') ? basePath + 'PLAN.md' : basePath + '/PLAN.md';
+        isPlan = true;
+    }
+
+    // Robust detection for any mention of implementation_plan.md
+    if (!isPlan && (content.includes("implementation_plan.md") || content.includes("PLAN.md"))) {
+        isPlan = true;
+        // Try to extract path if it's a link
+        const linkMatch = content.match(/\[.*?\]\((.*?implementation_plan\.md)\)/) || content.match(/\[.*?\]\((.*?PLAN\.md)\)/);
+        if (linkMatch) {
+            planPath = linkMatch[1];
+        } else {
+            // Default location if just mentioned
+            planPath = '.gemini/antigravity/brain/implementation_plan.md';
+        }
+    }
+
+    // Temporary Manual Override for testing/demos if needed
+    // const isPlan = content.includes("implementation_plan.md"); 
+
+    return {
+        thinking: thinking.trim() || null,
+        body: body.trim(),
+        isPlan,
+        planPath
+    };
+}
+
+function ImplementationPlanCard({ file }: { file?: string }) {
+    const { postMessage } = useVSCodeApi();
+    const filePath = file || '.gemini/antigravity/brain/implementation_plan.md'; // Fallback
+
+    return (
+        <div className="my-4 p-4 bg-vscode-editor-background border border-ricochet-primary/20 rounded-lg shadow-sm space-y-4 animate-fade-in">
             <div className="flex items-start gap-3">
                 <div className="flex-1 min-w-0">
                     <div className="text-[9px] font-black tracking-tighter text-ricochet-primary uppercase mb-1">PROPOSED PLAN</div>
@@ -551,7 +819,7 @@ function ImplementationPlanCard() {
                 <button
                     className="flex-1 flex items-center justify-center py-2 px-3 bg-vscode-button-secondaryBackground hover:bg-vscode-button-secondaryHover rounded text-xs font-bold tracking-wide transition-all border border-white/5 text-vscode-fg"
                     onClick={() => {
-                        postMessage({ type: 'open_file', payload: { path: '.gemini/antigravity/brain/d85108ee-0f2c-494a-8fed-209f639b42ce/implementation_plan.md' } });
+                        postMessage({ type: 'open_file', payload: { path: filePath } });
                     }}
                 >
                     VIEW FILE
@@ -562,46 +830,9 @@ function ImplementationPlanCard() {
                         postMessage({ type: 'send_message', payload: { content: 'I approve this plan. Proceed with execution.' } });
                     }}
                 >
-                    APPROVE
+                    PROCEED
                 </button>
             </div>
         </div>
     );
-}
-
-
-
-function parseContent(content: string) {
-    let thinking = "";
-    let body = "";
-    let lastIndex = 0;
-
-    // Regular expression for <thinking> blocks (handles open/streaming ones too)
-    const thinkingRegex = /<thinking>([\s\S]*?)(?:<\/thinking>|$)/g;
-    let match;
-
-    while ((match = thinkingRegex.exec(content)) !== null) {
-        // Append prefix text to body
-        body += content.substring(lastIndex, match.index);
-        // Append thinking content
-        thinking += (thinking ? "\n\n" : "") + match[1].trim();
-        // Update lastIndex to end of match
-        lastIndex = match.index + match[0].length;
-
-        // If the match didn't find a closing tag, we've hit the end of the current content
-        if (!match[0].endsWith('</thinking>')) break;
-    }
-
-    // Append remaining text
-    body += content.substring(lastIndex);
-
-    // Temporarily disabled: isPlan was triggering on any mention of "план" in Russian
-    // TODO: Implement proper logic that checks for actual implementation_plan.md file in the session
-    const isPlan = false;
-
-    return {
-        thinking: thinking.trim() || null,
-        body: body.trim(),
-        isPlan
-    };
 }

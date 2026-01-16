@@ -86,6 +86,10 @@ export function Settings({ onClose }: SettingsProps) {
         xai: [{ id: 'grok-code-fast-1', name: 'Grok Code Fast', contextWindow: 128000, inputPrice: 0.15, outputPrice: 0.6, isFree: false, supportsTools: true }],
         deepseek: [{ id: 'deepseek-chat', name: 'DeepSeek V3.2', contextWindow: 128000, inputPrice: 0.27, outputPrice: 1.10, isFree: false, supportsTools: true }],
         minimax: [{ id: 'MiniMax-M2.1', name: 'MiniMax M2.1', contextWindow: 200000, inputPrice: 0.5, outputPrice: 2, isFree: false, supportsTools: true }],
+        mistral: [
+            { id: 'codestral-latest', name: 'Codestral (Free)', contextWindow: 32000, inputPrice: 0, outputPrice: 0, isFree: true, supportsTools: true },
+            { id: 'ministral-8b-latest', name: 'Ministral 8B (Free)', contextWindow: 128000, inputPrice: 0, outputPrice: 0, isFree: true, supportsTools: true }
+        ],
         openrouter: [{ id: 'anthropic/claude-sonnet-4', name: 'Claude Sonnet 4', contextWindow: 200000, inputPrice: 3, outputPrice: 15, isFree: false, supportsTools: true }],
     };
 
@@ -157,9 +161,8 @@ export function Settings({ onClose }: SettingsProps) {
             }
             if (message.type === 'models') {
                 const result = message.payload as { providers: ProviderInfo[] };
-                // Strictly filter to DeepSeek as requested by the USER
-                const filtered = result.providers.filter(p => p.id === 'deepseek');
-                setProviders(filtered);
+                // Show all providers from backend config - no hardcoded filters
+                setProviders(result.providers || []);
             }
             if (message.type === 'bot_verification_result') {
                 const result = message.payload as BotInfo;

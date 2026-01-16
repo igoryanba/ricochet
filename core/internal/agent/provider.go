@@ -50,10 +50,11 @@ type Usage struct {
 
 // StreamChunk represents a streaming response chunk
 type StreamChunk struct {
-	Type       string                 `json:"type"` // content_block_delta, message_stop, etc.
-	Delta      string                 `json:"delta,omitempty"`
-	ToolUse    *protocol.ToolUseBlock `json:"tool_use,omitempty"`
-	StopReason string                 `json:"stop_reason,omitempty"`
+	Type           string                 `json:"type"` // content_block_delta, message_stop, etc.
+	Delta          string                 `json:"delta,omitempty"`
+	ReasoningDelta string                 `json:"reasoning_delta,omitempty"` // DeepSeek R1 reasoning
+	ToolUse        *protocol.ToolUseBlock `json:"tool_use,omitempty"`
+	StopReason     string                 `json:"stop_reason,omitempty"`
 }
 
 // ProviderConfig holds provider configuration
@@ -85,6 +86,12 @@ func NewProvider(cfg ProviderConfig) (Provider, error) {
 		return NewMinimaxProvider(cfg.APIKey, cfg.Model), nil
 	case "deepseek":
 		return NewOpenAIProvider(cfg.APIKey, cfg.Model, "https://api.deepseek.com/v1"), nil
+	case "mistral":
+		baseURL := "https://api.mistral.ai/v1"
+		if cfg.BaseURL != "" {
+			baseURL = cfg.BaseURL
+		}
+		return NewOpenAIProvider(cfg.APIKey, cfg.Model, baseURL), nil
 	default:
 		return nil, fmt.Errorf("unknown provider: %s", cfg.Provider)
 	}

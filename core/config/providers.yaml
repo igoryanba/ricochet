@@ -17,6 +17,22 @@ providers:
         output_price: 2.19
         supports_tools: false
 
+  mistral:
+    enabled: true
+    key: "${MISTRAL_API_KEY}"
+    base_url: "https://api.mistral.ai/v1"
+    models:
+      - id: "codestral-latest"
+        name: "Codestral (Free)"
+        context_window: 32000
+        free: true
+        supports_tools: true
+      - id: "ministral-8b-latest"
+        name: "Ministral 8B (Free)"
+        context_window: 128000
+        free: true
+        supports_tools: true
+
 #  gemini:
 #    enabled: true
 #    key: "${GEMINI_API_KEY}"

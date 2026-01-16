@@ -99,6 +99,10 @@ func (h *NativeHost) SendMessage(msg protocol.RPCMessage) {
 	fmt.Printf("[NOTIFICATION] Type: %s, Payload: %s\n", msg.Type, string(msg.Payload))
 }
 
+func (h *NativeHost) SendRequest(method string, payload interface{}) (interface{}, error) {
+	return nil, fmt.Errorf("SendRequest not implemented for NativeHost")
+}
+
 func (h *NativeHost) resolve(path string) string {
 	if filepath.IsAbs(path) {
 		return path

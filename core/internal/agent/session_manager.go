@@ -46,10 +46,19 @@ func NewSessionManager(storageDir string) *SessionManager {
 }
 
 func (m *SessionManager) CreateSession() *Session {
+	id := fmt.Sprintf("s_%d", time.Now().Unix())
+	return m.CreateSessionWithID(id)
+}
+
+func (m *SessionManager) CreateSessionWithID(id string) *Session {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	id := fmt.Sprintf("s_%d", time.Now().Unix())
+	// If it already exists (race condition check), return it
+	if session, ok := m.sessions[id]; ok {
+		return session
+	}
+
 	session := &Session{
 		ID:           id,
 		StateHandler: NewMessageStateHandler(id),
@@ -73,7 +82,7 @@ func (m *SessionManager) GetSession(id string) *Session {
 
 	// Default session
 	if id == "default" {
-		return m.CreateSession()
+		return m.CreateSessionWithID("default")
 	}
 
 	return nil

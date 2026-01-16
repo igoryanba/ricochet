@@ -1,4 +1,4 @@
-import { useState, useCallback, useEffect } from 'react';
+import { useState, useCallback, useEffect, useRef } from 'react';
 import { useVSCodeApi } from './useVSCodeApi';
 
 export interface ChatMessage {
@@ -57,6 +57,16 @@ export interface ContextStatus {
     cumulative_cost?: number;
 }
 
+export interface TaskProgress {
+    task_name: string;
+    status: string;
+    summary?: string;
+    mode?: 'planning' | 'execution' | 'verification';
+    steps: string[];
+    files: string[];
+    is_active: boolean;
+}
+
 export interface Todo {
     text: string;
     status: 'pending' | 'current' | 'completed';
@@ -73,28 +83,61 @@ export function useChat(sessionId: string = 'default') {
     const [inputValue, setInputValue] = useState('');
     const [currentMode, setCurrentMode] = useState<string>('code');
     const [contextStatus, setContextStatus] = useState<ContextStatus | null>(null);
+    const [taskProgress, setTaskProgress] = useState<TaskProgress | null>(null);
     const { postMessage, onMessage } = useVSCodeApi();
 
     const [fileResults, setFileResults] = useState<FileSearchResult[]>([]);
+
+    // Debounce for streaming updates - max 5 updates per second
+    const pendingUpdateRef = useRef<ChatMessage | null>(null);
+    const debounceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+    const DEBOUNCE_MS = 400; // Aggressive debounce to prevent crash during heavy streaming
+
+    const flushPendingUpdate = useCallback(() => {
+        debounceTimerRef.current = null;
+        if (pendingUpdateRef.current) {
+            const update = pendingUpdateRef.current;
+            pendingUpdateRef.current = null;
+            setMessages(prev => {
+                const existing = prev.find(m => m.id === update.id);
+                if (existing) {
+                    return prev.map(m => m.id === update.id ? update : m);
+                }
+                return [...prev, update];
+            });
+        }
+    }, []);
 
     // Listen for chat updates from extension
     useEffect(() => {
         const unsubscribe = onMessage((message) => {
             switch (message.type) {
                 case 'chat_update':
-                    // ... existing
                     const update = message.payload as { message: ChatMessage; session_id?: string };
                     if (update.session_id && update.session_id !== sessionId) return;
 
-                    setMessages(prev => {
-                        const existing = prev.find(m => m.id === update.message.id);
-                        if (existing) {
-                            return prev.map(m => m.id === update.message.id ? update.message : m);
-                        }
-                        return [...prev, update.message];
-                    });
+                    // Final messages apply immediately
                     if (!update.message.isStreaming) {
+                        // Clear any pending debounce
+                        if (debounceTimerRef.current) {
+                            clearTimeout(debounceTimerRef.current);
+                            debounceTimerRef.current = null;
+                        }
+                        pendingUpdateRef.current = null;
+                        setMessages(prev => {
+                            const existing = prev.find(m => m.id === update.message.id);
+                            if (existing) {
+                                return prev.map(m => m.id === update.message.id ? update.message : m);
+                            }
+                            return [...prev, update.message];
+                        });
                         setIsLoading(false);
+                    } else {
+                        // Streaming: debounce updates (only update every 200ms)
+                        pendingUpdateRef.current = update.message;
+                        if (!debounceTimerRef.current) {
+                            debounceTimerRef.current = setTimeout(flushPendingUpdate, DEBOUNCE_MS);
+                        }
                     }
                     break;
                 case 'chat_cleared':
@@ -124,6 +167,23 @@ export function useChat(sessionId: string = 'default') {
                 case 'context_status':
                     setContextStatus(message.payload as ContextStatus);
                     break;
+                case 'task_progress':
+                    const progress = message.payload as TaskProgress;
+                    setTaskProgress(prev => {
+                        // If same task, accumulate steps; otherwise replace
+                        if (prev && prev.task_name === progress.task_name) {
+                            return {
+                                ...progress,
+                                steps: [...prev.steps, progress.status],
+                                files: [...new Set([...prev.files, ...progress.files])]
+                            };
+                        }
+                        return {
+                            ...progress,
+                            steps: progress.status ? [progress.status] : [],
+                        };
+                    });
+                    break;
                 case 'error':
                     const errMsg = (message.payload as { message: string }).message;
                     setMessages(prev => [...prev, {
@@ -138,6 +198,11 @@ export function useChat(sessionId: string = 'default') {
         });
         return () => { unsubscribe(); };
     }, [onMessage, sessionId]);
+
+    // Request initial state on mount (restores history when switching views)
+    useEffect(() => {
+        postMessage({ type: 'get_state' });
+    }, [postMessage]);
 
     // ... existing initialization
 
@@ -220,6 +285,7 @@ export function useChat(sessionId: string = 'default') {
         inputValue,
         currentMode,
         contextStatus,
+        taskProgress,
         fileResults,
         setInputValue,
         sendMessage,

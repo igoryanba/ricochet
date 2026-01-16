@@ -17,7 +17,7 @@ type StdioHost struct {
 	cwd             string
 	orchestrator    *CommandOrchestrator
 	outputMu        sync.Mutex
-	pendingRequests map[string]chan string
+	pendingRequests map[string]chan json.RawMessage
 	mu              sync.Mutex
 }
 
@@ -25,7 +25,7 @@ func NewStdioHost(cwd string) *StdioHost {
 	return &StdioHost{
 		cwd:             cwd,
 		orchestrator:    NewCommandOrchestrator(cwd),
-		pendingRequests: make(map[string]chan string),
+		pendingRequests: make(map[string]chan json.RawMessage),
 	}
 }
 
@@ -92,7 +92,7 @@ func (h *StdioHost) AskUser(question string) (string, error) {
 }
 
 func (h *StdioHost) AskUserWithID(question string, id string) (string, error) {
-	ch := make(chan string)
+	ch := make(chan json.RawMessage)
 	h.mu.Lock()
 	h.pendingRequests[id] = ch
 	h.mu.Unlock()
@@ -108,14 +108,43 @@ func (h *StdioHost) AskUserWithID(question string, id string) (string, error) {
 	})
 
 	select {
-	case response := <-ch:
+	case responseBytes := <-ch:
+		var response string
+		if err := json.Unmarshal(responseBytes, &response); err != nil {
+			return "", fmt.Errorf("failed to parse response: %w", err)
+		}
 		return response, nil
 	case <-time.After(5 * time.Minute):
 		return "", fmt.Errorf("user response timeout")
 	}
 }
 
-func (h *StdioHost) HandleResponse(id string, payload string) {
+func (h *StdioHost) SendRequest(method string, payload interface{}) (interface{}, error) {
+	id := fmt.Sprintf("req-%d", time.Now().UnixNano())
+	ch := make(chan json.RawMessage)
+
+	h.mu.Lock()
+	h.pendingRequests[id] = ch
+	h.mu.Unlock()
+
+	defer func() {
+		h.mu.Lock()
+		delete(h.pendingRequests, id)
+		h.mu.Unlock()
+	}()
+
+	h.sendRequest(method, id, payload)
+
+	select {
+	case responseBytes := <-ch:
+		// Return RawMessage so caller can unmarshal into desired type
+		return responseBytes, nil
+	case <-time.After(1 * time.Minute):
+		return nil, fmt.Errorf("request timeout")
+	}
+}
+
+func (h *StdioHost) HandleResponse(id string, payload json.RawMessage) {
 	h.mu.Lock()
 	ch, ok := h.pendingRequests[id]
 	h.mu.Unlock()
@@ -133,11 +162,11 @@ func (h *StdioHost) resolve(path string) string {
 }
 
 func (h *StdioHost) sendNotification(msgType string, payload interface{}) {
-	h.send("notification", msgType, "", payload)
+	h.send(msgType, "", payload)
 }
 
 func (h *StdioHost) sendRequest(msgType string, id string, payload interface{}) {
-	h.send("request", msgType, id, payload)
+	h.send(msgType, id, payload)
 }
 
 func (h *StdioHost) SendMessage(msg protocol.RPCMessage) {
@@ -148,7 +177,7 @@ func (h *StdioHost) SendMessage(msg protocol.RPCMessage) {
 	fmt.Println(string(data))
 }
 
-func (h *StdioHost) send(msgKind string, msgType string, id string, payload interface{}) {
+func (h *StdioHost) send(msgType string, id string, payload interface{}) {
 	// Note: Standard RPC uses 'id' to distinguish requests from notifications.
 	msg := protocol.RPCMessage{
 		ID:      id,

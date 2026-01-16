@@ -86,3 +86,15 @@ func (f *FileTracker) GetContext() string {
 	}
 	return sb.String()
 }
+
+// GetFiles returns the list of accessed files as a slice
+func (f *FileTracker) GetFiles() []string {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+
+	var files []string
+	for path := range f.accessedFiles {
+		files = append(files, path)
+	}
+	return files
+}
