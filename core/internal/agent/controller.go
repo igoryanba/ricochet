@@ -22,6 +22,7 @@ import (
 	mcpHubPkg "github.com/igoryan-dao/ricochet/internal/mcp"
 	"github.com/igoryan-dao/ricochet/internal/modes"
 	"github.com/igoryan-dao/ricochet/internal/paths"
+	"github.com/igoryan-dao/ricochet/internal/prompts"
 	"github.com/igoryan-dao/ricochet/internal/protocol"
 	"github.com/igoryan-dao/ricochet/internal/qc"
 	"github.com/igoryan-dao/ricochet/internal/rules"
@@ -592,6 +593,27 @@ func (c *Controller) Chat(ctx context.Context, input ChatRequestInput, callback 
 		// SAFETY: Sanitize messages to ensure Tool Call/Result integrity
 		// This prevents API 400 errors if a previous session crashed/was pruned incorrectly
 		prunedMessages = c.sanitizeMessages(prunedMessages)
+
+		// =============================
+		// EPHEMERAL MESSAGE INJECTION
+		// =============================
+		// Build dynamic context for ephemeral reminders
+		ephemeralCtx := prompts.EphemeralContext{
+			Mode:          activeMode.Name, // "code", "planning", "execution", etc.
+			IsInTaskMode:  false,           // TODO: detect if in task mode
+			ToolCallCount: 0,               // Will be updated during streaming
+			// TODO: Add more context detection (hasplan, artifacts, failures, etc.)
+		}
+
+		ephemeralMsg := prompts.BuildEphemeralMessage(ephemeralCtx)
+		if ephemeralMsg != "" {
+			// Inject as final user message to maximize adherence
+			prunedMessages = append(prunedMessages, protocol.Message{
+				Role:    "user",
+				Content: ephemeralMsg,
+			})
+			log.Printf("📨 Ephemeral message injected (mode=%s)", activeMode.Name)
+		}
 
 		req := &ChatRequest{
 			Model:        c.config.Provider.Model,
