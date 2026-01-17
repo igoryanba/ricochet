@@ -597,12 +597,24 @@ func (c *Controller) Chat(ctx context.Context, input ChatRequestInput, callback 
 		// =============================
 		// EPHEMERAL MESSAGE INJECTION
 		// =============================
+		// Normalize mode name for ephemeral messages
+		normalizedMode := normalizeModeName(activeMode.Name)
+
+		// Detect if we're in task mode (basic heuristic: has todos or artifacts)
+		isInTaskMode := len(session.Todos) > 0
+
+		// TODO: Detect artifacts by checking for task.md, implementation_plan.md, etc.
+		// TODO: Track tool failures across turns
+		// TODO: Detect if plan exists
+
 		// Build dynamic context for ephemeral reminders
 		ephemeralCtx := prompts.EphemeralContext{
-			Mode:          activeMode.Name, // "code", "planning", "execution", etc.
-			IsInTaskMode:  false,           // TODO: detect if in task mode
-			ToolCallCount: 0,               // Will be updated during streaming
-			// TODO: Add more context detection (hasplan, artifacts, failures, etc.)
+			Mode:             normalizedMode,
+			IsInTaskMode:     isInTaskMode,
+			ToolCallCount:    0, // Will be tracked in future turns
+			HasPlan:          false,
+			LastToolFailed:   false,
+			ArtifactsCreated: []string{},
 		}
 
 		ephemeralMsg := prompts.BuildEphemeralMessage(ephemeralCtx)
@@ -612,7 +624,7 @@ func (c *Controller) Chat(ctx context.Context, input ChatRequestInput, callback 
 				Role:    "user",
 				Content: ephemeralMsg,
 			})
-			log.Printf("📨 Ephemeral message injected (mode=%s)", activeMode.Name)
+			log.Printf("📨 Ephemeral message injected (mode=%s, inTask=%v)", normalizedMode, isInTaskMode)
 		}
 
 		req := &ChatRequest{
@@ -1257,4 +1269,23 @@ func (c *Controller) SetCheckpointService(svc *checkpoints.CheckpointService) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.checkpointService = svc
+}
+
+// normalizeModeName converts mode names to match ephemeral message expectations
+// Maps various mode names to: "planning", "execution", "verification", or "code"
+func normalizeModeName(modeName string) string {
+	lower := strings.ToLower(modeName)
+
+	// Map common variations
+	switch {
+	case strings.Contains(lower, "plan"):
+		return "planning"
+	case strings.Contains(lower, "exec") || strings.Contains(lower, "implement") || strings.Contains(lower, "build"):
+		return "execution"
+	case strings.Contains(lower, "verify") || strings.Contains(lower, "test") || strings.Contains(lower, "check"):
+		return "verification"
+	default:
+		// Default: code mode
+		return "code"
+	}
 }
