@@ -199,10 +199,14 @@ export function useChat(sessionId: string = 'default') {
         return () => { unsubscribe(); };
     }, [onMessage, sessionId]);
 
-    // Request initial state on mount (restores history when switching views)
+    // Request state when sessionId changes (restores history when switching sessions)
     useEffect(() => {
-        postMessage({ type: 'get_state' });
-    }, [postMessage]);
+        // Clear messages first to prevent showing old session's messages
+        setMessages([]);
+        setTodos([]);
+        // Request new state for this session
+        postMessage({ type: 'get_state', payload: { sessionId } });
+    }, [postMessage, sessionId]);
 
     // ... existing initialization
 

@@ -201,7 +201,7 @@ func (e *NativeExecutor) GetDefinitions() []ToolDefinition {
 		},
 		{
 			Name:        "write_file",
-			Description: "Create a NEW file or completely overwrite an existing one. Use 'replace_file_content' for editing.",
+			Description: "ONLY for creating NEW files. ⚠️ CRITICAL: Do NOT use this to edit existing files! Use 'replace_file_content' instead. Using write_file on existing files DESTROYS diff history and prevents users from seeing changes.",
 			InputSchema: map[string]interface{}{
 				"type": "object",
 				"properties": map[string]interface{}{
@@ -219,7 +219,7 @@ func (e *NativeExecutor) GetDefinitions() []ToolDefinition {
 		},
 		{
 			Name:        "replace_file_content",
-			Description: "Edit an existing file by replacing specific content. PREFERRED over write_file for edits. PRESERVES history.",
+			Description: "✅ REQUIRED tool for editing files. Replaces specific text with new content. Shows diff to user. ALWAYS use this instead of write_file for any existing file modifications.",
 			InputSchema: map[string]interface{}{
 				"type": "object",
 				"properties": map[string]interface{}{

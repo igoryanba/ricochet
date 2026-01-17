@@ -56,6 +56,14 @@ Remember to:
 </execution_reminder>`)
 		}
 
+		// ALWAYS add file edit reminder in execution mode
+		reminders = append(reminders, `<file_edit_reminder>
+⚠️ CRITICAL FILE EDITING RULE:
+When editing existing files, you MUST use 'replace_file_content' tool.
+NEVER use 'write_file' to edit existing files - it destroys diff history!
+Exception: ONLY use write_file for creating NEW files that don't exist.
+</file_edit_reminder>`)
+
 	case "verification":
 		reminders = append(reminders, `<verification_reminder>
 You are in VERIFICATION mode. Test your changes thoroughly.

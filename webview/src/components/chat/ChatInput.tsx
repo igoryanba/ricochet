@@ -98,32 +98,53 @@ export function ChatInput(props: ChatInputProps) {
     const [availableCommands, setAvailableCommands] = useState(DEFAULT_COMMANDS);
     const { postMessage, onMessage } = useVSCodeApi();
 
-    // Fetch models on mount to get first available model
+    // Fetch models AND settings on mount
     useEffect(() => {
         postMessage({ type: 'get_models' });
+        postMessage({ type: 'get_settings' });
     }, [postMessage]);
 
-    // Listen for models response and set first available as current
+    // Listen for settings and models - SYNC with backend saved settings
     useEffect(() => {
         const unsubscribe = onMessage((msg: any) => {
-            if (msg.type === 'models' && currentModel.id === '') {
+            if (msg.type === 'settings_loaded') {
+                const settings = msg.payload;
+                if (settings?.provider && settings?.model) {
+                    // Use saved provider/model from backend
+                    setCurrentModel({
+                        id: settings.model,
+                        name: settings.model, // Will be updated when models arrive
+                        provider: settings.provider
+                    });
+                }
+            }
+            if (msg.type === 'models') {
                 const providers = msg.payload?.providers || [];
-                // Find first provider with models
-                for (const provider of providers) {
-                    if (provider.models && provider.models.length > 0) {
-                        const firstModel = provider.models[0];
-                        setCurrentModel({
-                            id: firstModel.id,
-                            name: firstModel.name,
-                            provider: provider.id
-                        });
-                        break;
+                // Update model name if we already have a model selected
+                if (currentModel.id && currentModel.provider) {
+                    const provider = providers.find((p: any) => p.id === currentModel.provider);
+                    const model = provider?.models?.find((m: any) => m.id === currentModel.id);
+                    if (model) {
+                        setCurrentModel(prev => ({ ...prev, name: model.name }));
+                    }
+                } else if (currentModel.id === '') {
+                    // Only use first available if no saved settings
+                    for (const provider of providers) {
+                        if (provider.models && provider.models.length > 0) {
+                            const firstModel = provider.models[0];
+                            setCurrentModel({
+                                id: firstModel.id,
+                                name: firstModel.name,
+                                provider: provider.id
+                            });
+                            break;
+                        }
                     }
                 }
             }
         });
         return () => { unsubscribe(); };
-    }, [onMessage, currentModel.id]);
+    }, [onMessage, currentModel.id, currentModel.provider]);
 
     // Sync Plan/Act mode with auto-approve settings
     // ACT mode = auto-approve file edits, PLAN mode = require approval
