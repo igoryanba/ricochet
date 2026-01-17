@@ -31,21 +31,28 @@ export default function App() {
 
     return (
         <div className="flex flex-col h-full w-full overflow-hidden bg-vscode-sideBar-background text-vscode-fg">
-            {currentView === 'chat' && (
+            {/* ChatView is ALWAYS mounted to preserve session state */}
+            <div className={currentView === 'chat' ? 'flex-1 flex flex-col overflow-hidden' : 'hidden'}>
                 <ChatView
                     onOpenSettings={() => setCurrentView('settings')}
                     onOpenHistory={() => setCurrentView('history')}
                     onOpenAgent={() => setCurrentView('agent')}
                 />
-            )}
+            </div>
+
+            {/* Modal overlays - ChatView stays mounted behind */}
             {currentView === 'settings' && (
-                <Settings onClose={() => setCurrentView('chat')} />
+                <div className="absolute inset-0 z-50 bg-vscode-sideBar-background">
+                    <Settings onClose={() => setCurrentView('chat')} />
+                </div>
             )}
             {currentView === 'history' && (
-                <HistoryView onDone={() => setCurrentView('chat')} />
+                <div className="absolute inset-0 z-50 bg-vscode-sideBar-background">
+                    <HistoryView onDone={() => setCurrentView('chat')} />
+                </div>
             )}
             {currentView === 'mcp' && (
-                <div className="h-full flex flex-col">
+                <div className="absolute inset-0 z-50 bg-vscode-sideBar-background h-full flex flex-col">
                     <div className="p-2">
                         <button onClick={() => setCurrentView('chat')} className="text-xs hover:underline mb-2">← Back to Chat</button>
                     </div>
@@ -55,7 +62,7 @@ export default function App() {
                 </div>
             )}
             {currentView === 'agent' && (
-                <div className="h-full flex flex-col">
+                <div className="absolute inset-0 z-50 bg-vscode-sideBar-background h-full flex flex-col">
                     <div className="p-2 border-b border-vscode-contrastBorder flex justify-between items-center">
                         <button onClick={() => setCurrentView('chat')} className="text-xs hover:underline">← Back to Chat</button>
                         <span className="text-xs font-bold opacity-70">AGENT MODE</span>
