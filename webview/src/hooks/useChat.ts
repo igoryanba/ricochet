@@ -169,20 +169,7 @@ export function useChat(sessionId: string = 'default') {
                     break;
                 case 'task_progress':
                     const progress = message.payload as TaskProgress;
-                    setTaskProgress(prev => {
-                        // If same task, accumulate steps; otherwise replace
-                        if (prev && prev.task_name === progress.task_name) {
-                            return {
-                                ...progress,
-                                steps: [...prev.steps, progress.status],
-                                files: [...new Set([...prev.files, ...progress.files])]
-                            };
-                        }
-                        return {
-                            ...progress,
-                            steps: progress.status ? [progress.status] : [],
-                        };
-                    });
+                    setTaskProgress(progress);
                     break;
                 case 'error':
                     const errMsg = (message.payload as { message: string }).message;
@@ -204,8 +191,13 @@ export function useChat(sessionId: string = 'default') {
         // Clear messages first to prevent showing old session's messages
         setMessages([]);
         setTodos([]);
-        // Request new state for this session
-        postMessage({ type: 'get_state', payload: { sessionId } });
+
+        // Use a short timeout to ensure the clear completes before the new load happens
+        // This prevents the 'flicker' where old messages might persist if get_state returns quickly
+        const t = setTimeout(() => {
+            postMessage({ type: 'get_state', payload: { sessionId } });
+        }, 10);
+        return () => clearTimeout(t);
     }, [postMessage, sessionId]);
 
     // ... existing initialization

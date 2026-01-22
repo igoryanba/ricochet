@@ -84,11 +84,15 @@ type DefinitionLocation struct {
 
 // TaskProgress represents structured task progress for UI display
 type TaskProgress struct {
-	TaskName string   `json:"task_name"`           // Header title
-	Status   string   `json:"status"`              // Current step description
-	Summary  string   `json:"summary,omitempty"`   // Overall summary
-	Mode     string   `json:"mode,omitempty"`      // planning, execution, verification
-	Steps    []string `json:"steps,omitempty"`     // Progress history
-	Files    []string `json:"files,omitempty"`     // Files modified during task
-	IsActive bool     `json:"is_active,omitempty"` // Whether task is still in progress
+	TaskName     string   `json:"task_name"`           // Header title
+	Status       string   `json:"status"`              // Current step description
+	Summary      string   `json:"summary,omitempty"`   // Overall summary
+	Result       string   `json:"result,omitempty"`    // Result of the last step (e.g. tool output)
+	Mode         string   `json:"mode,omitempty"`      // planning, execution, verification
+	Steps        []string `json:"steps,omitempty"`     // Progress history
+	Files        []string `json:"files,omitempty"`     // Files modified during task
+	IsActive     bool     `json:"is_active,omitempty"` // Whether task is still in progress
+	ParentTaskID string   `json:"parent_task_id,omitempty"`
+	ToolCount    int      `json:"tool_count,omitempty"`
+	TokenCount   int      `json:"token_count,omitempty"`
 }

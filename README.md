@@ -3,8 +3,6 @@
 # Ricochet
 
 
-Этот маркетплейс находится на бета-тесте, версия v0.0.1, план выпуска - конец января.
-
 It creates a hybrid development environment where you can pair-program with an autonomous agent directly in VS Code, or switch to **Live Mode** and control your development environment remotely via Telegram or Discord.
 
 Unlike standard autocomplete tools, Ricochet is designed for **autonomous task execution**. It manages its own context, learns from your project patterns, and runs quality checks to ensure code integrity.
@@ -66,6 +64,10 @@ Ricochet is an independent open-source project. If it helps you build faster, pl
 *   **Star the Repo**: [github.com/Grik-ai/ricochet](https://github.com/Grik-ai/ricochet)
 *   **Ko-fi**: [ko-fi.com/igoryan34](https://ko-fi.com/igoryan34)
 *   **PayPal**: [Donate via PayPal](https://www.paypal.com/ncp/payment/PPMFBMFVAB8QN)
+
+## Star History
+
+[![Star History Chart](https://api.star-history.com/svg?repos=Grik-ai/ricochet&type=date&legend=top-left)](https://www.star-history.com/#Grik-ai/ricochet&type=date&legend=top-left)
 
 ### License
 Apache 2.0 © 2025 Igor Pryimak

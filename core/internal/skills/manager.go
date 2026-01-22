@@ -8,6 +8,8 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+
+	"gopkg.in/yaml.v3"
 )
 
 // SkillRule defines when to trigger a specific skill
@@ -40,6 +42,20 @@ func NewManager(cwd string) *Manager {
 		cwd:    cwd,
 		skills: make(map[string]*SkillRule),
 	}
+}
+
+type skillFrontmatter struct {
+	Name        string `yaml:"name"`
+	Description string `yaml:"description"`
+	Type        string `yaml:"type"`
+	Enforcement string `yaml:"enforcement"`
+	Priority    string `yaml:"priority"`
+	Triggers    struct {
+		Keywords        []string `yaml:"keywords,omitempty"`
+		IntentPatterns  []string `yaml:"intentPatterns,omitempty"`
+		PathPatterns    []string `yaml:"pathPatterns,omitempty"`
+		ContentPatterns []string `yaml:"contentPatterns,omitempty"`
+	} `yaml:"triggers"`
 }
 
 // LoadSkills loads the skill-rules.json and associated markdown files
@@ -79,7 +95,76 @@ func (m *Manager) LoadSkills() error {
 		m.skills[name] = rule
 	}
 
+	// Load embedded skills
+	for _, skill := range PluginDevSkills() {
+		m.skills[skill.Name] = &SkillRule{
+			Name:           skill.Name,
+			Description:    skill.Description,
+			Type:           "embedded",
+			Enforcement:    skill.Enforcement,
+			Content:        skill.Content,
+			PromptTriggers: skill.Triggers,
+		}
+	}
+
+	// ─── Phase 19: Dynamic Project Skills ───
+	m.loadDynamicSkills()
+
 	return nil
+}
+
+func (m *Manager) loadDynamicSkills() {
+	skillsDir := filepath.Join(m.cwd, ".ricochet", "skills")
+	entries, err := os.ReadDir(skillsDir)
+	if err != nil {
+		return // Directory might not exist, that's fine
+	}
+
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+
+		skillName := entry.Name()
+		skillPath := filepath.Join(skillsDir, skillName, "SKILL.md")
+		data, err := os.ReadFile(skillPath)
+		if err != nil {
+			continue
+		}
+
+		content := string(data)
+		rule := &SkillRule{
+			Name: skillName,
+			Type: "dynamic",
+		}
+
+		// Check for YAML frontmatter
+		if strings.HasPrefix(content, "---") {
+			parts := strings.SplitN(content, "---", 3)
+			if len(parts) >= 3 {
+				var fm skillFrontmatter
+				if err := yaml.Unmarshal([]byte(parts[1]), &fm); err == nil {
+					if fm.Name != "" {
+						rule.Name = fm.Name
+					}
+					rule.Description = fm.Description
+					rule.Enforcement = fm.Enforcement
+					rule.Priority = fm.Priority
+					rule.PromptTriggers.Keywords = fm.Triggers.Keywords
+					rule.PromptTriggers.IntentPatterns = fm.Triggers.IntentPatterns
+					rule.FileTriggers.PathPatterns = fm.Triggers.PathPatterns
+					rule.FileTriggers.ContentPatterns = fm.Triggers.ContentPatterns
+					rule.Content = strings.TrimSpace(parts[2])
+				}
+			}
+		}
+
+		if rule.Content == "" {
+			rule.Content = content
+		}
+
+		m.skills[rule.Name] = rule
+	}
 }
 
 // FindApplicableSkills returns skills that match the context

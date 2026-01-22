@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 
@@ -63,11 +64,30 @@ func (e *NativeExecutor) ReadFile(args json.RawMessage) (string, error) {
 
 func (e *NativeExecutor) WriteFile(ctx context.Context, args json.RawMessage) (string, error) {
 	var payload struct {
-		Path    string `json:"path"`
-		Content string `json:"content"`
+		Path      string `json:"path"`
+		Content   string `json:"content"`
+		Overwrite bool   `json:"overwrite"`
 	}
 	if err := json.Unmarshal(args, &payload); err != nil {
 		return "", fmt.Errorf("invalid arguments: %w", err)
+	}
+
+	// CRITICAL: Check if file already exists - block write_file for existing files
+	// Agent MUST use replace_file_content for editing existing files to preserve diff history
+	// UNLESS overwrite is explicitly set to true.
+	absPath, _ := e.resolvePath(payload.Path)
+	if _, err := os.Stat(absPath); err == nil {
+		if !payload.Overwrite {
+			return "", fmt.Errorf("❌ BLOCKED: File '%s' already exists.\n\n"+
+				"🚫 write_file is ONLY for creating NEW files.\n"+
+				"✅ Use 'replace_file_content' tool to edit existing files.\n\n"+
+				"Why? replace_file_content:\n"+
+				"- Shows diff to user (green/red lines)\n"+
+				"- Creates checkpoints for undo\n"+
+				"- Preserves edit history\n\n"+
+				"write_file destroys all of this.\n\n"+
+				"FORCE OVERWRITE: If you are SURE you want to overwrite (e.g. config files), set `overwrite: true`.", payload.Path)
+		}
 	}
 
 	// Dynamic Mode check

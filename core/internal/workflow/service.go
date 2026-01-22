@@ -7,14 +7,16 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+
+	"gopkg.in/yaml.v3"
 )
 
 // Workflow represents a user-defined automation workflow
 type Workflow struct {
-	Command     string   `json:"command"`     // e.g. "/release"
-	Description string   `json:"description"` // e.g. "Prepare release"
-	Content     string   `json:"content"`     // Raw markdown content
-	Steps       []string `json:"steps"`       // Parsed steps (if applicable)
+	Command     string         `json:"command"`     // e.g. "/release"
+	Description string         `json:"description"` // e.g. "Prepare release"
+	Content     string         `json:"content"`     // Raw markdown content
+	Steps       []WorkflowStep `json:"steps"`       // Structured steps
 }
 
 // Manager handles loading and retrieving workflows
@@ -107,11 +109,12 @@ func (m *Manager) parseWorkflow(path string) (Workflow, error) {
 	wf := Workflow{
 		Command: command,
 		Content: string(content),
-		Steps:   []string{},
+		Steps:   []WorkflowStep{},
 	}
 
-	// Simple Frontmatter Parser
+	// Parse Frontmatter
 	scanner := bufio.NewScanner(strings.NewReader(string(content)))
+	var frontmatter strings.Builder
 	inFrontmatter := false
 	lineNum := 0
 
@@ -127,25 +130,22 @@ func (m *Manager) parseWorkflow(path string) (Workflow, error) {
 		if inFrontmatter {
 			if strings.TrimSpace(line) == "---" {
 				inFrontmatter = false
-				continue
+				break
 			}
-
-			// Key: Value
-			parts := strings.SplitN(line, ":", 2)
-			if len(parts) == 2 {
-				key := strings.TrimSpace(parts[0])
-				val := strings.TrimSpace(parts[1])
-				// Strip quotes
-				val = strings.Trim(val, `"'`)
-
-				if key == "description" {
-					wf.Description = val
-				}
-			}
+			frontmatter.WriteString(line + "\n")
 		}
 	}
 
-	// Fallback description if missing
+	// Unmarshal YAML frontmatter
+	var def WorkflowDefinition
+	if err := yaml.Unmarshal([]byte(frontmatter.String()), &def); err != nil {
+		fmt.Printf("Warning: Failed to parse YAML frontmatter for %s: %v\n", filename, err)
+	}
+
+	wf.Description = def.Description
+	wf.Steps = def.Steps // Store structured steps if available
+
+	// Fallback description
 	if wf.Description == "" {
 		wf.Description = fmt.Sprintf("Run %s workflow", basename)
 	}

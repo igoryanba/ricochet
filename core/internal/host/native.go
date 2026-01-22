@@ -95,6 +95,10 @@ func (h *NativeHost) AskUser(question string) (string, error) {
 	return "", fmt.Errorf("AskUser not implemented for NativeHost")
 }
 
+func (h *NativeHost) AskUserChoice(question string, choices []string) (int, error) {
+	return 0, fmt.Errorf("AskUserChoice not implemented for NativeHost")
+}
+
 func (h *NativeHost) SendMessage(msg protocol.RPCMessage) {
 	fmt.Printf("[NOTIFICATION] Type: %s, Payload: %s\n", msg.Type, string(msg.Payload))
 }

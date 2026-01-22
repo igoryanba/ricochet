@@ -25,6 +25,11 @@ func NewEnvironmentTracker(cwd string) *EnvironmentTracker {
 	return &EnvironmentTracker{cwd: cwd}
 }
 
+// GetCwd returns the tracked current working directory
+func (e *EnvironmentTracker) GetCwd() string {
+	return e.cwd
+}
+
 func (e *EnvironmentTracker) GetContext() string {
 	var sb strings.Builder
 	sb.WriteString("## Environment Context\n")

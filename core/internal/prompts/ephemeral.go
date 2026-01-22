@@ -107,12 +107,32 @@ CRITICAL: Artifacts should be concise and user-focused.
 
 	// Communication reminder (always shown when in task mode)
 	if ctx.IsInTaskMode {
-		reminders = append(reminders, `<communication_reminder>
-IMPORTANT: Explain your reasoning and approach BEFORE executing tools.
-Users appreciate understanding your thought process.
-Use the thinking block or explain in your response.
-</communication_reminder>`)
+		reminders = append(reminders, `<agentic_flow_reminder>
+🚨 SILENT AGENTIC FLOW MANDATORY:
+- DO NOT repeat or acknowledge the user's request in chat.
+- NO "I understand", "I'll do that", or "Starting plan...".
+- CALL task_boundary AT THE START of your response to update the UI.
+- Use chat ONLY for brief (<1 sentence) immediate status or questions.
+- High-level planning belongs in implementation_plan.md, not chat.
+</agentic_flow_reminder>`)
 	}
+
+	// ALWAYS show file edit reminder (enforced by backend, but reminder helps)
+	reminders = append(reminders, `<file_edit_enforcement>
+🚨 FILE EDITING IS ENFORCED BY BACKEND:
+- write_file ONLY works for NEW files (backend rejects existing files)
+- For ANY existing file: MUST use 'replace_file_content'
+- Attempting to write_file an existing file will FAIL with error
+</file_edit_enforcement>`)
+
+	// ALWAYS show artifact creation reminder for large outputs
+	reminders = append(reminders, `<artifact_creation_rule>
+📄 LARGE OUTPUT RULE (MANDATORY):
+- If your response would exceed 500 words: CREATE A MARKDOWN FILE
+- Use write_file for: project_analysis.md, implementation_plan.md, etc.
+- Then reply with SHORT summary (2-3 sentences max)
+- DO NOT paste large reports directly in chat
+</artifact_creation_rule>`)
 
 	// Combine all reminders
 	if len(reminders) == 0 {

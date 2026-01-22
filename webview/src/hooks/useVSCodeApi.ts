@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef } from 'react';
+import { useCallback } from 'react';
 
 interface VSCodeApi {
     postMessage: (message: unknown) => void;
@@ -24,38 +24,39 @@ function getVSCodeApi(): VSCodeApi | null {
     return null;
 }
 
+// Singleton event logic
 type MessageHandler = (message: { type: string; payload?: unknown }) => void;
+const globalHandlers = new Set<MessageHandler>();
+
+// Setup global listener once
+if (typeof window !== 'undefined') {
+    window.addEventListener('message', (event: MessageEvent) => {
+        const message = event.data;
+        // console.log('[VSCodeApi] Received:', message.type);
+        globalHandlers.forEach(handler => handler(message));
+    });
+}
 
 /**
  * Hook for communicating with VSCode extension host.
  * Returns postMessage function and onMessage subscriber.
  */
 export function useVSCodeApi() {
-    const handlersRef = useRef<Set<MessageHandler>>(new Set());
     const api = getVSCodeApi();
-
-    useEffect(() => {
-        const handleMessage = (event: MessageEvent) => {
-            const message = event.data;
-            handlersRef.current.forEach(handler => handler(message));
-        };
-
-        window.addEventListener('message', handleMessage);
-        return () => window.removeEventListener('message', handleMessage);
-    }, []);
 
     const postMessage = useCallback((message: unknown) => {
         if (api) {
             api.postMessage(message);
         } else {
-            // Development mode - log to console
             console.log('[DEV] postMessage:', message);
         }
     }, [api]);
 
     const onMessage = useCallback((handler: MessageHandler) => {
-        handlersRef.current.add(handler);
-        return () => handlersRef.current.delete(handler);
+        globalHandlers.add(handler);
+        return () => {
+            globalHandlers.delete(handler);
+        };
     }, []);
 
     const getState = useCallback(() => api?.getState(), [api]);

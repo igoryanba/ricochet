@@ -29,7 +29,7 @@ interface ChatViewProps {
  */
 export function ChatView({ onOpenSettings }: ChatViewProps) {
     const { currentSessionId } = useSessions();
-    const { messages, todos, isLoading, inputValue, setInputValue, sendMessage, cancelGeneration, executeCommand, restoreCheckpoint } = useChat(currentSessionId || 'default');
+    const { messages, todos, isLoading, inputValue, setInputValue, sendMessage, cancelGeneration, executeCommand, restoreCheckpoint, taskProgress } = useChat(currentSessionId || 'default');
     const { status: liveStatus, toggleLiveMode } = useLiveMode();
     const scrollRef = useRef<HTMLDivElement>(null);
     // Auto-respond to permission requests to prevent Promise deadlock
@@ -99,7 +99,8 @@ export function ChatView({ onOpenSettings }: ChatViewProps) {
 
             {/* Content area */}
             <div className="flex-1 min-h-0 flex flex-col pt-0.5">
-                <TodoTracker todos={todos} />
+                {/* Only show old TodoTracker if NO taskProgress (fallback for old behavior) */}
+                {!taskProgress && <TodoTracker todos={todos} />}
 
                 <div className="flex-1 min-h-0">
                     {messages.length === 0 ? (
@@ -109,14 +110,23 @@ export function ChatView({ onOpenSettings }: ChatViewProps) {
                             ref={scrollRef}
                             className="h-full overflow-y-auto"
                         >
-                            {messages.map((message) => (
-                                <ChatMessage
-                                    key={message.id}
-                                    message={message}
-                                    onExecuteCommand={executeCommand}
-                                    onRestore={restoreCheckpoint}
-                                />
-                            ))}
+                            {messages.map((message, index) => {
+                                // Attach taskProgress to the most recent streaming/active assistant message (Antigravity-style)
+                                // This ensures the progress card appears inline with the current response
+                                const isLastAssistant = message.role === 'assistant' &&
+                                    messages.slice(index + 1).every(m => m.role !== 'assistant');
+                                const shouldShowProgress = isLastAssistant && taskProgress?.is_active;
+
+                                return (
+                                    <ChatMessage
+                                        key={message.id}
+                                        message={message}
+                                        taskProgress={shouldShowProgress ? taskProgress : undefined}
+                                        onExecuteCommand={executeCommand}
+                                        onRestore={restoreCheckpoint}
+                                    />
+                                );
+                            })}
                         </div>
                     )}
                 </div>

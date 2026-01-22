@@ -33,7 +33,7 @@ export async function activate(context: vscode.ExtensionContext) {
     // Register commands
     context.subscriptions.push(
         vscode.commands.registerCommand('ricochet.newChat', async () => {
-            await webviewProvider.clearChat();
+            await webviewProvider.createNewSession();
         })
     );
 
@@ -61,7 +61,41 @@ export async function activate(context: vscode.ExtensionContext) {
         })
     );
 
+    // Register generic install command
+    context.subscriptions.push(
+        vscode.commands.registerCommand('ricochet.installCli', async () => {
+            await installCli(context);
+        })
+    );
+
+    // Check if CLI is installed on startup
+    checkCliInstallation(context);
+
     console.log('Ricochet extension activated');
+}
+
+import { installCli } from './commands/installCli';
+import * as fs from 'fs';
+import * as path from 'path';
+import * as os from 'os';
+
+function checkCliInstallation(context: vscode.ExtensionContext) {
+    const homeDir = os.homedir();
+    const targetPath = path.join(homeDir, '.local', 'bin', 'ricochet');
+
+    // Simple check: does the file exist?
+    // In future we might check versions
+    if (!fs.existsSync(targetPath)) {
+        vscode.window.showInformationMessage(
+            "Ricochet CLI is not installed in ~/.local/bin. Install it for terminal integration?",
+            "Install",
+            "Ignore"
+        ).then(selection => {
+            if (selection === "Install") {
+                vscode.commands.executeCommand('ricochet.installCli');
+            }
+        });
+    }
 }
 
 export async function deactivate() {

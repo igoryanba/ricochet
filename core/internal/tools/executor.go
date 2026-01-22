@@ -72,7 +72,53 @@ func (e *NativeExecutor) SetLiveMode(lm LiveModeProvider) {
 	e.livemode = lm
 }
 
+// Hook interface for intercepting tool execution
+type ToolHook interface {
+	Name() string
+	PreExecute(ctx context.Context, toolName string, args map[string]interface{}) error
+}
+
+// BashValidator hook to enforce best practices
+type BashValidator struct{}
+
+func (h *BashValidator) Name() string { return "BashValidator" }
+
+func (h *BashValidator) PreExecute(ctx context.Context, toolName string, args map[string]interface{}) error {
+	if toolName != "execute_command" {
+		return nil
+	}
+
+	cmd, ok := args["command"].(string)
+	if !ok {
+		return nil
+	}
+
+	// 1. Block 'grep' without 'ripgrep' suggestion
+	if strings.HasPrefix(cmd, "grep ") && !strings.Contains(cmd, "|") {
+		return fmt.Errorf("⚠️ Safety Hook: Use 'rg' (ripgrep) instead of 'grep' for better performance and respect for .gitignore. If you must use grep, pipe it or use 'git grep'.")
+	}
+
+	// 2. Block 'find -name' without 'fd' suggestion
+	if strings.HasPrefix(cmd, "find ") && strings.Contains(cmd, " -name ") {
+		return fmt.Errorf("⚠️ Safety Hook: Use 'fd' instead of 'find' for faster searching. Example: 'fd pattern'.")
+	}
+
+	return nil
+}
+
 func (e *NativeExecutor) Execute(ctx context.Context, name string, args json.RawMessage) (string, error) {
+	// 0. Parse args into map for hooks (optimization: only if hooks exist)
+	// For now, we only have one hardcoded hook, so let's check it.
+	// In the future, e.hooks would determine this.
+	// Just unmarshal once for generic usage if needed.
+	var argsMap map[string]interface{}
+	if err := json.Unmarshal(args, &argsMap); err == nil {
+		hook := &BashValidator{}
+		if err := hook.PreExecute(ctx, name, argsMap); err != nil {
+			return "", err
+		}
+	}
+
 	// 1. Enforce Trust Zones
 	if e.safeguard != nil {
 		if err := e.safeguard.CheckPermission(name); err != nil {
@@ -81,6 +127,20 @@ func (e *NativeExecutor) Execute(ctx context.Context, name string, args json.Raw
 	}
 
 	switch name {
+	case "ask_user_choice":
+		var payload struct {
+			Question string   `json:"question"`
+			Choices  []string `json:"choices"`
+		}
+		if err := json.Unmarshal(args, &payload); err != nil {
+			return "", err
+		}
+		index, err := e.host.AskUserChoice(payload.Question, payload.Choices)
+		if err != nil {
+			return "", err
+		}
+		return fmt.Sprintf("User selected choice %d: %s", index+1, payload.Choices[index]), nil
+
 	case "list_dir":
 		return e.ListDir(args)
 	case "read_file":
@@ -111,7 +171,7 @@ func (e *NativeExecutor) Execute(ctx context.Context, name string, args json.Raw
 		return e.GetDefinitionsLSP(ctx, args)
 	case "switch_mode":
 		return e.SwitchMode(args)
-	case "update_todos":
+	case "update_todos", "task_boundary", "update_plan":
 		return "Interpreted by controller", nil
 	case "get_workflows":
 		return e.GetWorkflows(ctx, args)
@@ -127,9 +187,11 @@ func (e *NativeExecutor) Execute(ctx context.Context, name string, args json.Raw
 	default:
 		// Check MCP tools
 		if e.mcpHub != nil {
-			var argsMap map[string]interface{}
-			if err := json.Unmarshal(args, &argsMap); err != nil {
-				return "", fmt.Errorf("invalid arguments for MCP tool: %w", err)
+			// argsMap is already parsed above if successful, or we re-parse
+			if argsMap == nil {
+				if err := json.Unmarshal(args, &argsMap); err != nil {
+					return "", fmt.Errorf("invalid arguments for MCP tool: %w", err)
+				}
 			}
 
 			result, err := e.mcpHub.CallTool(ctx, name, argsMap)
@@ -212,6 +274,10 @@ func (e *NativeExecutor) GetDefinitions() []ToolDefinition {
 					"content": map[string]interface{}{
 						"type":        "string",
 						"description": "Content to write",
+					},
+					"overwrite": map[string]interface{}{
+						"type":        "boolean",
+						"description": "Set to true to overwrite existing file (WARNING: Destroys history).",
 					},
 				},
 				"required": []string{"path", "content"},
@@ -377,6 +443,20 @@ func (e *NativeExecutor) GetDefinitions() []ToolDefinition {
 		},
 	})
 
+	// Add ask_user_choice tool
+	defs = append(defs, ToolDefinition{
+		Name:        "ask_user_choice",
+		Description: "Ask the user to choose from a list of options. Use this for clarification.",
+		InputSchema: map[string]interface{}{
+			"type": "object",
+			"properties": map[string]interface{}{
+				"question": map[string]interface{}{"type": "string", "description": "The question to ask"},
+				"choices":  map[string]interface{}{"type": "array", "items": map[string]interface{}{"type": "string"}},
+			},
+			"required": []string{"question", "choices"},
+		},
+	})
+
 	// Add LSP tools
 	defs = append(defs, ToolDefinition{
 		Name:        "get_diagnostics",
@@ -419,7 +499,7 @@ func (e *NativeExecutor) GetDefinitions() []ToolDefinition {
 	})
 
 	// Add Task Workspace tools
-	defs = append(defs, StartTaskTool)
+	defs = append(defs, StartTaskTool, TaskBoundaryTool, UpdatePlanTool)
 
 	// Add browser tools
 	defs = append(defs, ToolDefinition{

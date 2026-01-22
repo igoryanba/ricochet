@@ -91,6 +91,11 @@ func (h *StdioHost) AskUser(question string) (string, error) {
 	return h.AskUserWithID(question, id)
 }
 
+func (h *StdioHost) AskUserChoice(question string, choices []string) (int, error) {
+	id := fmt.Sprintf("choice-%d", time.Now().UnixNano())
+	return h.AskUserChoiceWithID(question, choices, id)
+}
+
 func (h *StdioHost) AskUserWithID(question string, id string) (string, error) {
 	ch := make(chan json.RawMessage)
 	h.mu.Lock()
@@ -116,6 +121,35 @@ func (h *StdioHost) AskUserWithID(question string, id string) (string, error) {
 		return response, nil
 	case <-time.After(5 * time.Minute):
 		return "", fmt.Errorf("user response timeout")
+	}
+}
+
+func (h *StdioHost) AskUserChoiceWithID(question string, choices []string, id string) (int, error) {
+	ch := make(chan json.RawMessage)
+	h.mu.Lock()
+	h.pendingRequests[id] = ch
+	h.mu.Unlock()
+
+	defer func() {
+		h.mu.Lock()
+		delete(h.pendingRequests, id)
+		h.mu.Unlock()
+	}()
+
+	h.sendRequest("ask_user_choice", id, map[string]interface{}{
+		"question": question,
+		"choices":  choices,
+	})
+
+	select {
+	case responseBytes := <-ch:
+		var response int
+		if err := json.Unmarshal(responseBytes, &response); err != nil {
+			return 0, fmt.Errorf("failed to parse choice response: %w", err)
+		}
+		return response, nil
+	case <-time.After(5 * time.Minute):
+		return 0, fmt.Errorf("user choice response timeout")
 	}
 }
 

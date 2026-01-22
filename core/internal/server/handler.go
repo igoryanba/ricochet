@@ -136,6 +136,30 @@ func (h *Handler) HandleMessage(msg protocol.RPCMessage, writer ResponseWriter) 
 			Payload: protocol.EncodeRPC(session),
 		})
 
+	case "hydrate_session":
+		var payload struct {
+			SessionID string             `json:"session_id"`
+			Messages  []protocol.Message `json:"messages"`
+		}
+		if err := json.Unmarshal(msg.Payload, &payload); err != nil {
+			writer.Send(protocol.RPCMessage{ID: msg.ID, Error: "Invalid payload: " + err.Error()})
+			return
+		}
+
+		if h.Agent == nil {
+			if err := h.lazyInitAgent(); err != nil {
+				writer.Send(protocol.RPCMessage{ID: msg.ID, Error: err.Error()})
+				return
+			}
+		}
+
+		h.Agent.HydrateSession(payload.SessionID, payload.Messages)
+		writer.Send(protocol.RPCMessage{
+			ID:      msg.ID,
+			Type:    "session_hydrated",
+			Payload: protocol.EncodeRPC(map[string]bool{"success": true}),
+		})
+
 	case "delete_session":
 		var payload struct {
 			SessionID string `json:"session_id"`

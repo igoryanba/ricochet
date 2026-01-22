@@ -259,10 +259,9 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
                 case 'audio_stop':
                     await this.core.send(message.type, message.payload || {});
                     break;
-                case 'get_state':
-                    const state = await this.core.send('get_state', {});
-                    this.postMessage({ type: 'state', payload: state });
-                    break;
+                // case 'get_state':
+                //     // Handled by ChatService which respects session_id
+                //     break;
 
                 // Session Management
                 case 'list_sessions':
@@ -270,20 +269,24 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
                     this.postMessage({ type: 'session_list', payload: { sessions } });
                     break;
                 case 'create_session':
-                    if (vscode.workspace.workspaceFolders && vscode.workspace.workspaceFolders.length > 0) {
-                        const newId = await this.sessionService.createSession(vscode.workspace.workspaceFolders[0].uri.fsPath);
-                        this.chatService?.setActiveSession(newId);
-                        this.postMessage({ type: 'session_created', payload: { id: newId } });
-                    }
+                    await this.createNewSession();
                     break;
 
                 case 'load_session':
                     const sessionData = await this.sessionService.loadSession(message.payload.id);
                     if (sessionData) {
                         this.chatService?.setActiveSession(message.payload.id);
-                        // Send to Core to hydrate state
-                        // For now, we might just assume core is stateless or we re-hydrate frontend
-                        // Real implementation would tell Core to reset context.
+
+                        try {
+                            // Hydrate backend with session history
+                            await this.core.send('hydrate_session', {
+                                session_id: message.payload.id,
+                                messages: sessionData.messages
+                            });
+                        } catch (e) {
+                            console.error('Failed to hydrate session:', e);
+                        }
+
                         this.postMessage({ type: 'session_loaded', payload: { id: message.payload.id, ...sessionData } });
                     }
                     break;
@@ -482,6 +485,25 @@ export class WebviewProvider implements vscode.WebviewViewProvider {
     // Public methods for extension.ts
     async clearChat(): Promise<void> {
         await this.chatService?.handleMessage({ type: 'clear_chat' });
+    }
+
+    async createNewSession(): Promise<void> {
+        if (vscode.workspace.workspaceFolders && vscode.workspace.workspaceFolders.length > 0) {
+            const newId = await this.sessionService.createSession(vscode.workspace.workspaceFolders[0].uri.fsPath);
+            this.chatService?.setActiveSession(newId);
+
+            // Hydrate core with empty session to reset context
+            try {
+                await this.core.send('hydrate_session', {
+                    session_id: newId,
+                    messages: []
+                });
+            } catch (e) {
+                console.error('Failed to hydrate new session:', e);
+            }
+
+            this.postMessage({ type: 'session_created', payload: { id: newId } });
+        }
     }
 
     async toggleLiveMode(): Promise<void> {

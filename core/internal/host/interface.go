@@ -23,6 +23,7 @@ type Host interface {
 	// UI / Interaction
 	ShowMessage(level string, text string)
 	AskUser(question string) (string, error)
+	AskUserChoice(question string, choices []string) (int, error)
 	SendMessage(msg protocol.RPCMessage)
 	SendRequest(method string, payload interface{}) (interface{}, error)
 }

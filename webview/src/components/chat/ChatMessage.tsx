@@ -3,7 +3,7 @@ import { ChevronDown, ChevronRight, ChevronUp, FileText, Edit3, Terminal, Rotate
 import { ChatMessage as ChatMessageType, ToolCall, ActivityItem, TaskProgress } from '@hooks/useChat';
 import { useVSCodeApi } from '@hooks/useVSCodeApi';
 import { DiffView, parseDiff } from '../diff/DiffView';
-import { TaskProgressCard } from './TaskProgressCard';
+import { TaskProgressCard, ArtifactCard, InlineActivity } from './TaskProgressCard';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
@@ -81,12 +81,14 @@ const UserContent = ({ content, via, remoteUsername }: { content: string; via?: 
     );
 };
 
+
 function AssistantContent({ message, taskProgress, onExecuteCommand }: {
     message: ChatMessageType;
     taskProgress?: TaskProgress | null;
     onExecuteCommand?: (cmd: string) => void
 }) {
-    const { thinking, body, isPlan, planPath } = useMemo(() => parseContent(message.content), [message.content]);
+    const { thinking, body, artifacts } = useMemo(() => parseContent(message.content), [message.content]);
+    const { postMessage } = useVSCodeApi();
 
     return (
         <div className="text-[12px]">
@@ -95,7 +97,7 @@ function AssistantContent({ message, taskProgress, onExecuteCommand }: {
                 <TaskProgressCard
                     taskName={taskProgress.task_name}
                     summary={taskProgress.summary || ''}
-                    mode={taskProgress.mode || 'execution'}
+                    mode={taskProgress.mode as any || 'execution'}
                     steps={taskProgress.steps}
                     filesEdited={taskProgress.files}
                     isActive={taskProgress.is_active}
@@ -108,9 +110,15 @@ function AssistantContent({ message, taskProgress, onExecuteCommand }: {
                 <ProgressBlock activities={message.activities || []} toolCalls={message.toolCalls || []} />
             )}
 
-            {isPlan && (
-                <ImplementationPlanCard file={planPath} />
-            )}
+            {artifacts.map((artifact, i) => (
+                <ArtifactCard
+                    key={i}
+                    type={artifact.type}
+                    title={artifact.title}
+                    summary={artifact.summary}
+                    onOpen={() => postMessage({ type: 'open_file', payload: { path: artifact.path } })}
+                />
+            ))}
 
             <div className="text-vscode-fg leading-relaxed mt-2 overflow-hidden max-w-none space-y-2">
                 <MarkdownContent content={body} onExecuteCommand={onExecuteCommand} />
@@ -378,54 +386,37 @@ function ProgressBlock({ activities, toolCalls }: { activities: ActivityItem[]; 
     const [isExpanded, setIsExpanded] = useState(true);
     const { postMessage } = useVSCodeApi();
 
-    const getActivityLabel = (activity: ActivityItem) => {
-        const fileName = activity.file?.split('/').pop() || activity.file;
-
-        switch (activity.type) {
-            case 'search':
-                return (
-                    <div className="flex items-center gap-2 overflow-hidden">
-                        <span className="text-vscode-fg/50 flex-shrink-0">Searched</span>
-                        <span className="text-blue-400 font-mono truncate">{activity.query}</span>
-                        {activity.results !== undefined && (
-                            <span className="text-vscode-fg/30 flex-shrink-0 ml-1">— {activity.results} results</span>
-                        )}
-                    </div>
-                );
-            case 'analyze':
-                return (
-                    <div className="flex items-center gap-2 overflow-hidden">
-                        <span className="text-vscode-fg/40 flex-shrink-0">Analyzed</span>
-                        <button
-                            className="text-blue-400/80 hover:text-blue-400 hover:underline font-mono transition-colors truncate"
-                            onClick={() => postMessage({ type: 'open_file', payload: { path: activity.file } })}
-                        >
-                            {fileName}
-                        </button>
-                        {activity.lineRange && <span className="text-vscode-fg/20 flex-shrink-0 text-[9px]">#{activity.lineRange}</span>}
-                    </div>
-                );
-            case 'edit':
-                return (
-                    <div className="flex items-center gap-2 overflow-hidden">
-                        <span className="text-vscode-fg/50 flex-shrink-0">Edited</span>
-                        <button
-                            className="text-blue-400 hover:underline font-mono truncate"
-                            onClick={() => postMessage({ type: 'open_file', payload: { path: activity.file } })}
-                        >
-                            {fileName}
-                        </button>
-                        {(activity.additions !== undefined || activity.deletions !== undefined) && (
-                            <span className="flex-shrink-0 flex items-center gap-1 text-[10px] tabular-nums bg-white/5 px-1 rounded-sm">
-                                {activity.additions !== undefined && <span className="text-green-400">+{activity.additions}</span>}
-                                {activity.deletions !== undefined && <span className="text-red-400">-{activity.deletions}</span>}
-                            </span>
-                        )}
-                    </div>
-                );
-            case 'command':
-                return <span className="text-vscode-fg/50 mb-0.5">Ran command</span>;
+    const renderActivity = (activity: ActivityItem, i: number) => {
+        if (activity.type === 'analyze') {
+            return (
+                <InlineActivity
+                    key={`act-${i}`}
+                    type="analyzed"
+                    filename={activity.file || ''}
+                    lineRange={activity.lineRange}
+                />
+            );
         }
+        if (activity.type === 'edit') {
+            return (
+                <InlineActivity
+                    key={`act-${i}`}
+                    type="edited"
+                    filename={activity.file || ''}
+                    onView={() => postMessage({ type: 'open_file', payload: { path: activity.file } })}
+                />
+            );
+        }
+        if (activity.type === 'search') {
+            return (
+                <InlineActivity
+                    key={`act-${i}`}
+                    type="searched"
+                    filename={activity.query || 'search'}
+                />
+            );
+        }
+        return null;
     };
 
     if (!isExpanded) {
@@ -445,11 +436,7 @@ function ProgressBlock({ activities, toolCalls }: { activities: ActivityItem[]; 
         <div className="mb-4 overflow-hidden animate-fade-in max-w-full">
             <div className="flex flex-col gap-1.5 relative pl-3 before:content-[''] before:absolute before:left-0 before:top-2 before:bottom-2 before:w-[1px] before:bg-white/5">
                 {/* Render Activities for high-level summary */}
-                {activities.map((activity, i) => (
-                    <div key={`act-${i}`} className="flex items-center gap-2 text-[11px] text-vscode-fg/60 hover:text-vscode-fg/80 transition-opacity">
-                        <div className="flex-1 min-w-0">{getActivityLabel(activity)}</div>
-                    </div>
-                ))}
+                {activities.map((activity, i) => renderActivity(activity, i))}
 
                 {/* Render Tool Calls (Detailed Trace) */}
                 <div className="flex flex-col gap-0.5 mt-1 opacity-100 transition-opacity">
@@ -762,77 +749,51 @@ function parseContent(content: string) {
     // Append remaining text
     body += content.substring(lastIndex);
 
-    // Check for "start_task" output pattern
-    // e.g. "✅ Task Workspace created at `.agent/tasks/refactor_auth/`."
-    const taskMatch = content.match(/Task Workspace created at `(.+?)`/);
-    let planPath: string | undefined;
-    let isPlan = false;
+    // Detect artifacts (implementation_plan.md, walkthrough.md, task.md)
+    const artifacts: Array<{
+        type: 'walkthrough' | 'implementation_plan' | 'task' | 'other';
+        title: string;
+        summary: string;
+        path: string;
+    }> = [];
 
-    if (taskMatch) {
-        // Construct path to PLAN.md
-        const basePath = taskMatch[1];
-        planPath = basePath.endsWith('/') ? basePath + 'PLAN.md' : basePath + '/PLAN.md';
-        isPlan = true;
-    }
+    // Regex to find markdown links to artifacts
+    const artifactRegex = /\[(.*?)\]\((.*?(\.md))\)/g;
+    let artMatch;
+    while ((artMatch = artifactRegex.exec(content)) !== null) {
+        const path = artMatch[2];
+        const fileName = path.split('/').pop()?.toLowerCase() || "";
 
-    // Robust detection for any mention of implementation_plan.md
-    if (!isPlan && (content.includes("implementation_plan.md") || content.includes("PLAN.md"))) {
-        isPlan = true;
-        // Try to extract path if it's a link
-        const linkMatch = content.match(/\[.*?\]\((.*?implementation_plan\.md)\)/) || content.match(/\[.*?\]\((.*?PLAN\.md)\)/);
-        if (linkMatch) {
-            planPath = linkMatch[1];
-        } else {
-            // Default location if just mentioned
-            planPath = '.gemini/antigravity/brain/implementation_plan.md';
+        if (fileName.includes('implementation_plan') || fileName === 'plan.md') {
+            artifacts.push({
+                type: 'implementation_plan',
+                title: 'Implementation Plan',
+                summary: 'Technical breakdown and proposed changes.',
+                path
+            });
+        } else if (fileName.includes('walkthrough')) {
+            artifacts.push({
+                type: 'walkthrough',
+                title: 'Walkthrough',
+                summary: 'Summary of completed work and verification results.',
+                path
+            });
+        } else if (fileName.includes('task')) {
+            artifacts.push({
+                type: 'task',
+                title: 'Task Tracking',
+                summary: 'Checklist of tasks and their current progress.',
+                path
+            });
         }
     }
 
-    // Temporary Manual Override for testing/demos if needed
-    // const isPlan = content.includes("implementation_plan.md"); 
+    // Deduplicate artifacts by path
+    const uniqueArtifacts = Array.from(new Map(artifacts.map(a => [a.path, a])).values());
 
     return {
         thinking: thinking.trim() || null,
         body: body.trim(),
-        isPlan,
-        planPath
+        artifacts: uniqueArtifacts
     };
-}
-
-function ImplementationPlanCard({ file }: { file?: string }) {
-    const { postMessage } = useVSCodeApi();
-    const filePath = file || '.gemini/antigravity/brain/implementation_plan.md'; // Fallback
-
-    return (
-        <div className="my-4 p-4 bg-vscode-editor-background border border-ricochet-primary/20 rounded-lg shadow-sm space-y-4 animate-fade-in">
-            <div className="flex items-start gap-3">
-                <div className="flex-1 min-w-0">
-                    <div className="text-[9px] font-black tracking-tighter text-ricochet-primary uppercase mb-1">PROPOSED PLAN</div>
-                    <h3 className="text-sm font-bold text-vscode-fg leading-tight">Implementation Plan</h3>
-                    <p className="text-[11px] text-vscode-fg/40 mt-1 line-clamp-2 italic">
-                        Technical breakdown and proposed changes for the current task.
-                    </p>
-                </div>
-            </div>
-
-            <div className="flex items-center gap-2">
-                <button
-                    className="flex-1 flex items-center justify-center py-2 px-3 bg-vscode-button-secondaryBackground hover:bg-vscode-button-secondaryHover rounded text-xs font-bold tracking-wide transition-all border border-white/5 text-vscode-fg"
-                    onClick={() => {
-                        postMessage({ type: 'open_file', payload: { path: filePath } });
-                    }}
-                >
-                    VIEW FILE
-                </button>
-                <button
-                    className="flex-1 flex items-center justify-center py-2 px-3 bg-ricochet-primary text-white hover:opacity-90 rounded text-xs font-black tracking-wide transition-all shadow-md"
-                    onClick={() => {
-                        postMessage({ type: 'send_message', payload: { content: 'I approve this plan. Proceed with execution.' } });
-                    }}
-                >
-                    PROCEED
-                </button>
-            </div>
-        </div>
-    );
 }

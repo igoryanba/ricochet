@@ -74,6 +74,11 @@
                 "command": "ricochet.openSettings",
                 "title": "Open Settings",
                 "icon": "$(settings-gear)"
+            },
+            {
+                "command": "ricochet.installCli",
+                "title": "Install CLI Globally",
+                "icon": "$(terminal)"
             }
         ],
         "menus": {

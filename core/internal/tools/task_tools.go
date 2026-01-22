@@ -31,6 +31,60 @@ var StartTaskTool = ToolDefinition{
 	},
 }
 
+// TaskBoundaryTool updates the current task state following the Antigravity pattern
+var TaskBoundaryTool = ToolDefinition{
+	Name:        "task_boundary",
+	Description: "Update the current task state (Mode, Name, Status, Summary). This tool controls the UI progress card and synchronizes the agent's internal state with the user's view.",
+	InputSchema: map[string]interface{}{
+		"type": "object",
+		"properties": map[string]interface{}{
+			"TaskName": map[string]interface{}{
+				"type":        "string",
+				"description": "Name of the current major task (e.g., 'Implementing Auth')",
+			},
+			"Mode": map[string]interface{}{
+				"type":        "string",
+				"enum":        []string{"PLANNING", "EXECUTION", "VERIFICATION"},
+				"description": "The current phase of work",
+			},
+			"TaskSummary": map[string]interface{}{
+				"type":        "string",
+				"description": "Concise summary of what has been accomplished so far",
+			},
+			"TaskStatus": map[string]interface{}{
+				"type":        "string",
+				"description": "What you are about to do next (displayed as active status)",
+			},
+			"PredictedTaskSize": map[string]interface{}{
+				"type":        "integer",
+				"description": "Estimated remaining tool calls for this task",
+			},
+		},
+		"required": []string{"TaskName", "Mode", "TaskSummary", "TaskStatus", "PredictedTaskSize"},
+	},
+}
+
+// UpdatePlanTool updates the persistent task list (PlanManager)
+var UpdatePlanTool = ToolDefinition{
+	Name:        "update_plan",
+	Description: "Update the status of a task in the Master Plan. Use this to mark tasks as 'active' (when you start working on them) or 'done' (when completed).",
+	InputSchema: map[string]interface{}{
+		"type": "object",
+		"properties": map[string]interface{}{
+			"task_id": map[string]interface{}{
+				"type":        "string",
+				"description": "The ID of the task to update (e.g. '1', '2')",
+			},
+			"status": map[string]interface{}{
+				"type":        "string",
+				"enum":        []string{"pending", "active", "done", "failed"},
+				"description": "The new status of the task",
+			},
+		},
+		"required": []string{"task_id", "status"},
+	},
+}
+
 func sanitizeTaskName(name string) string {
 	name = strings.ToLower(name)
 	return strings.Map(func(r rune) rune {

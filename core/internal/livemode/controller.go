@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/igoryan-dao/ricochet/internal/agent"
+	"github.com/igoryan-dao/ricochet/internal/protocol"
 	"github.com/igoryan-dao/ricochet/internal/state"
 	"github.com/igoryan-dao/ricochet/internal/telegram"
 )
@@ -36,12 +37,52 @@ type Controller struct {
 	// Callback for emitting activity events to extension
 	onActivity func(EtherActivity)
 
+	// Callback for forwarding task progress to IDE
+	onTaskProgress func(protocol.TaskProgress)
+
 	// Callback for forwarding chat updates to IDE
 	onChatUpdate func(agent.ChatUpdate)
+
+	// Callback for user input injection (CLI/TUI)
+	onUserMessage func(string)
+
+	// Main Session ID (from TUI/CLI) to bind Telegram to
+	mainSessionID string
 
 	// Throttling for streaming updates to prevent webview crash
 	lastChatUpdateTime time.Time
 }
+
+// SetMainSessionID sets the primary session ID for binding
+func (c *Controller) SetMainSessionID(id string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.mainSessionID = id
+}
+
+// ... (skip lines)
+
+// SetOnTaskProgress sets the callback for forwarding task progress
+func (c *Controller) SetOnTaskProgress(fn func(protocol.TaskProgress)) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.onTaskProgress = fn
+}
+
+// ... (skip lines)
+
+// emitTaskProgress forwards task progress to the IDE
+func (c *Controller) emitTaskProgress(progress protocol.TaskProgress) {
+	c.mu.RLock()
+	fn := c.onTaskProgress
+	c.mu.RUnlock()
+
+	if fn != nil {
+		fn(progress)
+	}
+}
+
+// ... (skip lines)
 
 // Config holds Live Mode configuration
 type Config struct {
@@ -89,7 +130,7 @@ func New(cfg *Config, agentCtrl *agent.Controller) (*Controller, error) {
 	// Create state manager
 	stateMgr, err := state.NewManager()
 	if err != nil {
-		log.Printf("Warning: Failed to create state manager: %v", err)
+		// log.Printf("Warning: Failed to create state manager: %v", err)
 		// Continue without persistence
 	}
 
@@ -127,51 +168,43 @@ func (c *Controller) Start(ctx context.Context) {
 	// Start message listener
 	go c.listenForMessages(ctx)
 
-	log.Println("Live Mode background poller started")
+	// log.Println("Live Mode background poller started")
 }
 
 // Enable starts Live Mode
 func (c *Controller) Enable(ctx context.Context) (*Status, error) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	if c.enabled {
-		return c.getStatusLocked(), nil
-	}
-
 	c.enabled = true
-
-	// Notify user
-	if c.chatID != 0 && c.tgBot != nil {
-		c.tgBot.SendMessage(ctx, c.chatID, "🟢 **Live Mode Enabled**\n\nYou can now send messages here to control Ricochet!")
-	}
-
+	c.mu.Unlock() // Release lock
 	c.broadcastStatus()
-	log.Println("Live Mode enabled")
 
-	return c.getStatusLocked(), nil
+	// Notify user safely in background
+	if c.chatID != 0 && c.tgBot != nil {
+		go func() {
+			c.tgBot.SendMessage(context.Background(), c.chatID, "🟢 **Live Mode Enabled**\n\nYou can now send messages here to control Ricochet!")
+		}()
+	}
+	// log.Println("Live Mode enabled")
+
+	return c.GetStatus(), nil
 }
 
 // Disable stops Live Mode
 func (c *Controller) Disable(ctx context.Context) (*Status, error) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	if !c.enabled {
-		return c.getStatusLocked(), nil
-	}
-
 	c.enabled = false
-
-	// Notify user
-	if c.chatID != 0 && c.tgBot != nil {
-		c.tgBot.SendMessage(ctx, c.chatID, "🔴 **Live Mode Disabled**\n\nReturning control to IDE.")
-	}
-
+	c.mu.Unlock() // Release lock
 	c.broadcastStatus()
-	log.Println("Live Mode disabled")
 
-	return c.getStatusLocked(), nil
+	// Notify user safely in background
+	if c.chatID != 0 && c.tgBot != nil {
+		go func() {
+			c.tgBot.SendMessage(context.Background(), c.chatID, "🔴 **Live Mode Disabled**\n\nReturning control to IDE.")
+		}()
+	}
+	// log.Println("Live Mode disabled")
+
+	return c.GetStatus(), nil
 }
 
 // Toggle toggles Live Mode on/off
@@ -242,18 +275,47 @@ func (c *Controller) handleTelegramMessage(ctx context.Context, resp *telegram.U
 	log.Printf("Live Mode received message from chat %d: %s", resp.ChatID, resp.Text)
 
 	// Auto-Enable if disabled
+	// Auto-Enable if disabled
 	if !c.IsEnabled() {
 		log.Println("Live Mode triggering AUTO-ENABLE via Telegram")
 		c.mu.Lock()
 		c.enabled = true
 		c.mu.Unlock()
 
+		// FORCE NEW SESSION on auto-enable
+		// This breaks any stale links to CLI sessions (Zombie Session Fix)
+		if c.agent != nil {
+			// Check if we have a main session bound (TUI active)
+			var boundSessionID string
+			if c.mainSessionID != "" {
+				boundSessionID = c.mainSessionID
+				log.Printf("Live Mode: Auto-binding to Main Session %s", boundSessionID)
+			} else {
+				// Create new if unbound
+				s := c.agent.CreateSession()
+				boundSessionID = s.ID
+				log.Printf("Live Mode: Auto-Enable forced new session %s for chat %d", s.ID, resp.ChatID)
+			}
+
+			c.tgBot.SetActiveSession(resp.ChatID, boundSessionID)
+		}
+
 		c.tgBot.SendMessage(ctx, resp.ChatID, "🟢 **Ricochet Activated!**\n\nBridging to IDE...")
 		c.broadcastStatus()
 	}
 
 	if c.agent == nil {
-		c.tgBot.SendMessage(ctx, resp.ChatID, "⚠️ Agent not configured")
+		// If agent is nil, checking if we have a TUI handler wired
+		c.mu.RLock()
+		handler := c.onUserMessage
+		c.mu.RUnlock()
+
+		if handler != nil {
+			handler(resp.Text)
+			return
+		}
+
+		c.tgBot.SendMessage(ctx, resp.ChatID, "⚠️ Agent not configured and no input handler wired.")
 		return
 	}
 
@@ -273,8 +335,32 @@ func (c *Controller) handleTelegramMessage(ctx context.Context, resp *telegram.U
 	// Emit receiving activity
 	c.emitActivity("receiving", "telegram", resp.Username, resp.Text)
 
+	// Resolve Session ID EARLY so we can tag the user message
+	sessionID := c.tgBot.GetActiveSession(resp.ChatID)
+	// Check if session ID is valid AND exists in current agent instance
+	if sessionID == "" || c.agent.GetSession(sessionID) == nil {
+		// FALLBACK: User wants to resume the Active Shell Session (if any)
+		// Check if there are any active sessions in the agent.
+		sessions := c.agent.ListSessions()
+		if len(sessions) > 0 {
+			// ListSessions returns sorted by CreatedAt descending (0 is latest)
+			// Adopt the latest session (likely the TUI session)
+			sessionID = sessions[0].ID
+			log.Printf("Live Mode: Resuming existing active session %s for chat %d", sessionID, resp.ChatID)
+		} else {
+			// No active session found? Create a NEW one.
+			s := c.agent.CreateSession()
+			sessionID = s.ID
+			log.Printf("Live Mode: Created new session %s for chat %d", sessionID, resp.ChatID)
+		}
+
+		// Bind to chat
+		c.tgBot.SetActiveSession(resp.ChatID, sessionID)
+	}
+
 	// Forward user message to IDE
 	c.emitChatUpdate(agent.ChatUpdate{
+		SessionID: sessionID, // Propagate session ID for TUI Sync
 		Message: agent.ChatMessage{
 			ID:        fmt.Sprintf("tg-%d-%d", resp.ChatID, resp.MessageID),
 			Role:      "user",
@@ -282,6 +368,7 @@ func (c *Controller) handleTelegramMessage(ctx context.Context, resp *telegram.U
 			Timestamp: resp.Timestamp,
 			Via:       "telegram",
 			Username:  resp.Username,
+			SessionID: sessionID,
 		},
 	})
 
@@ -292,8 +379,6 @@ func (c *Controller) handleTelegramMessage(ctx context.Context, resp *telegram.U
 	c.emitActivity("processing", "telegram", resp.Username, "")
 
 	// Stream response to Telegram
-	var currentMsgID int
-	var currentContent string
 
 	// Handle /sessions command
 	if resp.Text == "/sessions" {
@@ -309,62 +394,48 @@ func (c *Controller) handleTelegramMessage(ctx context.Context, resp *telegram.U
 		return
 	}
 
-	// Resolve Session ID
-	sessionID := c.tgBot.GetActiveSession(resp.ChatID)
-	if sessionID == "" {
-		sessionID = "default"
-	}
+	// Stream response to Telegram
 
 	// Inject ChatID into context so tools (AskUserRemote) know where to reply
 	chatCtx := context.WithValue(ctx, chatIDKey, resp.ChatID)
+
+	// Stream response to Shell, send final to Telegram
+	var currentContent string
 
 	err := c.agent.Chat(chatCtx, agent.ChatRequestInput{
 		SessionID: sessionID,
 		Content:   resp.Text,
 		Via:       "telegram",
 	}, func(update interface{}) {
-		// Only handle ChatUpdate for now
+		// Handle TaskProgress for Shell
+		if tp, ok := update.(protocol.TaskProgress); ok {
+			c.emitTaskProgress(tp)
+			return
+		}
+
+		// Only handle ChatUpdate for Shell
 		chatUpdate, ok := update.(agent.ChatUpdate)
 		if !ok {
 			return
 		}
 
-		// Forward updates to IDE with via field
+		// Store final content for Telegram delivery after loop finishes
+		currentContent = chatUpdate.Message.Content
+
+		// Forward updates to Shell with via field
 		chatUpdate.Message.Via = "telegram"
 		c.emitChatUpdate(chatUpdate)
-
-		// Forward to Telegram
-		content := chatUpdate.Message.Content
-		if content == "" || content == currentContent {
-			return
-		}
-
-		// Only send partial updates for non-streaming or final messages
-		// If streaming, only update every few chars or after significant time
-		if chatUpdate.Message.IsStreaming && len(content)-len(currentContent) < 20 {
-			return
-		}
-
-		currentContent = content
-
-		// Truncate for Telegram's 4096 char limit
-		if len(content) > 4000 {
-			content = content[:4000] + "..."
-		}
-
-		if currentMsgID == 0 {
-			// First message - send new
-			msgID, err := c.tgBot.SendMessageAndTrack(ctx, resp.ChatID, content)
-			if err != nil {
-				log.Printf("Failed to send message: %v", err)
-				return
-			}
-			currentMsgID = msgID
-		} else {
-			// Update message
-			c.tgBot.EditMessage(ctx, resp.ChatID, currentMsgID, content)
-		}
 	})
+
+	// After the Agent is done, send a SINGLE message to Telegram
+	if currentContent != "" {
+		_, sendErr := c.tgBot.SendMessageAndTrack(ctx, resp.ChatID, currentContent)
+		if sendErr != nil {
+			log.Printf("Failed to send final message to Telegram: %v", sendErr)
+		}
+	} else if err != nil {
+		c.tgBot.SendMessage(ctx, resp.ChatID, fmt.Sprintf("❌ Error: %v", err))
+	}
 
 	// Emit responding activity (done)
 	c.emitActivity("responding", "telegram", resp.Username, "")
@@ -482,6 +553,13 @@ func (c *Controller) SetOnChatUpdate(fn func(agent.ChatUpdate)) {
 	c.onChatUpdate = fn
 }
 
+// SetOnUserMessage sets the callback for injecting user input (CLI/TUI)
+func (c *Controller) SetOnUserMessage(fn func(string)) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.onUserMessage = fn
+}
+
 // emitActivity sends an activity event to the extension
 func (c *Controller) emitActivity(stage, source, username, preview string) {
 	c.mu.RLock()
@@ -510,10 +588,14 @@ func (c *Controller) emitChatUpdate(update agent.ChatUpdate) {
 	lastTime := c.lastChatUpdateTime
 	now := time.Now()
 
-	// Throttle streaming updates to max 4/second (250ms interval)
+	// Throttle streaming updates to max 20/second (50ms interval) for smoother UI
 	// Final messages (IsStreaming=false) bypass throttle
-	const throttleInterval = 250 * time.Millisecond
-	if update.Message.IsStreaming && now.Sub(lastTime) < throttleInterval {
+	const throttleInterval = 50 * time.Millisecond
+
+	// Bypass throttle for reasoning updates (to show thinking immediately)
+	hasReasoning := update.Message.Reasoning != ""
+
+	if update.Message.IsStreaming && !hasReasoning && now.Sub(lastTime) < throttleInterval {
 		c.mu.Unlock()
 		return
 	}
@@ -521,6 +603,10 @@ func (c *Controller) emitChatUpdate(update agent.ChatUpdate) {
 	c.mu.Unlock()
 
 	if fn != nil {
+		// Populate SessionID from the update wrapper if missing in message
+		if update.Message.SessionID == "" {
+			update.Message.SessionID = update.SessionID
+		}
 		fn(update)
 	}
 }

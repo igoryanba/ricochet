@@ -77,7 +77,7 @@ export class ChatService {
                 break;
 
             case 'get_state':
-                const state = await this.core.send('get_state', {});
+                const state = await this.core.send('get_state', { session_id: message.payload.sessionId });
                 this.postMessage({ type: 'state', payload: state });
                 break;
 
@@ -107,8 +107,7 @@ export class ChatService {
             // Save to session
             if (this.activeSessionId && payload.message && !payload.message.partial) {
                 await this.sessionService.appendMessage(this.activeSessionId, {
-                    role: 'assistant',
-                    content: payload.message.content,
+                    ...payload.message,
                     timestamp: Date.now()
                 });
             }

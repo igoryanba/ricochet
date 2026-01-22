@@ -6,13 +6,13 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"path"
 	"path/filepath"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/igoryan-dao/ricochet/internal/checkpoints"
+	"github.com/google/uuid"
+	"github.com/igoryan-dao/ricochet/internal/agent/hooks"
 	"github.com/igoryan-dao/ricochet/internal/codegraph"
 	"github.com/igoryan-dao/ricochet/internal/config"
 	context_manager "github.com/igoryan-dao/ricochet/internal/context"
@@ -21,7 +21,6 @@ import (
 	"github.com/igoryan-dao/ricochet/internal/index"
 	mcpHubPkg "github.com/igoryan-dao/ricochet/internal/mcp"
 	"github.com/igoryan-dao/ricochet/internal/modes"
-	"github.com/igoryan-dao/ricochet/internal/paths"
 	"github.com/igoryan-dao/ricochet/internal/prompts"
 	"github.com/igoryan-dao/ricochet/internal/protocol"
 	"github.com/igoryan-dao/ricochet/internal/qc"
@@ -44,15 +43,21 @@ type Controller struct {
 	modes             *modes.Manager
 	rules             *rules.Manager
 	host              host.Host
-	checkpointService *checkpoints.CheckpointService
+	checkpointManager *CheckpointManager
 	providersManager  *config.ProvidersManager
 	indexer           *index.Indexer
 
-	codegraph      *codegraph.Service
-	handoffService *handoff.Service
-	workflows      *workflow.Manager
-	skills         *skills.Manager
-	qcManager      *qc.Manager
+	codegraph          *codegraph.Service
+	handoffService     *handoff.Service
+	workflows          *workflow.Manager
+	workflowEngine     *workflow.Engine
+	skills             *skills.Manager
+	qcManager          *qc.Manager
+	dynamicHooks       *hooks.DynamicHookManager
+	memoryManager      *MemoryManager
+	injectionProcessor *InjectionProcessor
+	loopDetector       *LoopDetector // Detects repetitive content patterns
+	planManager        *PlanManager  // Manages long-term plan
 
 	// Abort support
 	abortMu     sync.Mutex
@@ -141,6 +146,11 @@ func NewController(cfg *Config, opts ...ControllerOptions) (*Controller, error) 
 		safeguardMgr.SetAutoApproval(cfg.AutoApproval)
 	}
 
+	// Initialize Session Manager
+	// Store sessions in .ricochet/sessions
+	sessionDir := filepath.Join(os.Getenv("HOME"), ".ricochet", "sessions")
+	sessionManager := NewSessionManager(sessionDir)
+
 	// Initialize Embedder
 	// If EmbeddingProvider is configured, use it. Otherwise try to use main provider.
 	var embedder index.Embedder
@@ -172,6 +182,21 @@ func NewController(cfg *Config, opts ...ControllerOptions) (*Controller, error) 
 
 	// Initialize QC Manager
 	qcMgr := qc.NewManager(cwd)
+
+	// Initialize Dynamic Hook Manager (Hookify)
+	hooksMgr := hooks.NewDynamicHookManager(cwd)
+
+	// Initialize Memory Manager (Phase 15)
+	memoryMgr := NewMemoryManager(cwd)
+
+	// Initialize Injection Processor (Phase 17)
+	injectionProc := NewInjectionProcessor(cwd)
+
+	// Initialize Plan Manager (Autonomous Agent)
+	pmMgr := NewPlanManager(cwd)
+	if err := pmMgr.Load(); err != nil {
+		log.Printf("Warning: Failed to load plan: %v", err)
+	}
 
 	executor := tools.NewNativeExecutor(h, mm, safeguardMgr, mcpHub, indexer, cg, wm)
 
@@ -205,23 +230,32 @@ func NewController(cfg *Config, opts ...ControllerOptions) (*Controller, error) 
 	}
 
 	// Initialize session manager
-	storageDir := paths.GetSessionDir(cwd)
-	sm := NewSessionManager(storageDir)
+	// storageDir := paths.GetSessionDir(cwd) // Using sessionDir from above
+	// sm := NewSessionManager(storageDir)
 
-	return &Controller{
-		provider:         provider,
-		sessionManager:   sm,
-		config:           cfg,
-		executor:         executor,
-		envTracker:       context_manager.NewEnvironmentTracker(cwd),
-		safeguard:        safeguardMgr,
-		modes:            mm,
-		rules:            rm,
-		host:             h,
-		providersManager: pm,
-		indexer:          indexer,
-		skills:           skillMgr,
-		qcManager:        qcMgr,
+	// Initialize Checkpoint Manager (Phase 18)
+	checkpointMgr := NewCheckpointManager(cwd)
+
+	c := &Controller{
+		provider:           provider,
+		sessionManager:     sessionManager,
+		config:             cfg,
+		executor:           executor,
+		envTracker:         context_manager.NewEnvironmentTracker(cwd),
+		safeguard:          safeguardMgr,
+		modes:              mm,
+		rules:              rm,
+		host:               h,
+		providersManager:   pm,
+		indexer:            indexer,
+		skills:             skillMgr,
+		qcManager:          qcMgr,
+		dynamicHooks:       hooksMgr,
+		memoryManager:      memoryMgr,
+		injectionProcessor: injectionProc,
+		checkpointManager:  checkpointMgr,
+		planManager:        pmMgr,
+		loopDetector:       NewLoopDetector(3), // Detect loops after 3 repetitions
 		handoffService: handoff.NewService(func(ctx context.Context, prompt string) (string, error) {
 			req := &ChatRequest{
 				Model:     cfg.Provider.Model,
@@ -234,7 +268,33 @@ func NewController(cfg *Config, opts ...ControllerOptions) (*Controller, error) 
 			}
 			return resp.Content, nil
 		}),
-	}, nil
+		workflows: wm,
+	}
+
+	// Initialize Workflow Engine with Controller as executor
+	// Initialize Workflow Engine with Controller as executor
+	// We pass a simple adapter for command execution
+	c.workflowEngine = workflow.NewEngine(c, &CommandExecutorAdapter{Host: h})
+
+	return c, nil
+}
+
+func (c *Controller) GetHost() host.Host {
+	return c.host
+}
+
+// CommandExecutorAdapter adapts host.Host to workflow.CommandExecutor
+type CommandExecutorAdapter struct {
+	Host host.Host
+}
+
+func (a *CommandExecutorAdapter) Execute(command string) (string, error) {
+	// We assume context background for now or TODO pass it
+	res, err := a.Host.ExecuteCommand(context.Background(), command, false)
+	if err != nil {
+		return "", err
+	}
+	return res.Output, nil
 }
 
 func truncateString(s string, max int) string {
@@ -286,6 +346,13 @@ func (c *Controller) ListSessions() []*Session {
 	return c.sessionManager.ListSessions()
 }
 
+// HydrateSession restores a session with messages from history
+func (c *Controller) HydrateSession(sessionID string, messages []protocol.Message) {
+	// CreateSessionWithID acts as GetOrCreate - returning existing if found, or creating new
+	session := c.sessionManager.CreateSessionWithID(sessionID)
+	session.StateHandler.SetMessages(messages)
+}
+
 // DeleteSession deletes a session
 func (c *Controller) DeleteSession(id string) error {
 	return c.sessionManager.DeleteSession(id)
@@ -302,6 +369,7 @@ type ChatRequestInput struct {
 	SessionID string `json:"session_id"`
 	Content   string `json:"content"`
 	Via       string `json:"via,omitempty"` // Message source: telegram, discord, ide
+	PlanMode  bool   `json:"plan_mode,omitempty"`
 }
 
 // ChatUpdate represents a chat update event
@@ -316,6 +384,7 @@ type ChatMessage struct {
 	ID             string         `json:"id"`
 	Role           string         `json:"role"`
 	Content        string         `json:"content"`
+	Reasoning      string         `json:"reasoning,omitempty"`
 	Timestamp      int64          `json:"timestamp"`
 	IsStreaming    bool           `json:"isStreaming,omitempty"`
 	ToolCalls      []ToolCallInfo `json:"toolCalls,omitempty"`
@@ -323,6 +392,7 @@ type ChatMessage struct {
 	Steps          []ProgressStep `json:"steps,omitempty"`      // Real-time progress updates
 	Metadata       *TaskMetadata  `json:"metadata,omitempty"`
 	Via            string         `json:"via,omitempty"`            // Message source: telegram, discord, ide
+	SessionID      string         `json:"sessionId,omitempty"`      // Session context for this message
 	Username       string         `json:"username,omitempty"`       // Remote username for Ether messages
 	CheckpointHash string         `json:"checkpointHash,omitempty"` // Workspace snapshot hash for restore
 }
@@ -336,6 +406,7 @@ type ActivityItem struct {
 	Additions int    `json:"additions,omitempty"` // for edit
 	Deletions int    `json:"deletions,omitempty"` // for edit
 	Query     string `json:"query,omitempty"`     // for search
+	Message   string `json:"message,omitempty"`   // for task_boundary/notifications
 }
 
 // TaskMetadata tracks usage statistics
@@ -377,22 +448,135 @@ func (c *Controller) Chat(ctx context.Context, input ChatRequestInput, callback 
 	}()
 
 	session := c.GetSession(input.SessionID)
+	if session == nil {
+		return fmt.Errorf("session '%s' not found. Type /new to start.", input.SessionID)
+	}
 
 	// Add user message if content provided
 	if input.Content != "" {
+		if input.PlanMode {
+			// Prepend a Plan Mode constraint
+			session.StateHandler.AddMessage(protocol.Message{
+				Role:    "system",
+				Content: "PLAN MODE ENABLED: You are in read-only mode for exploration and planning. You can use search and read tools, but avoid making any file changes or executing destructive commands. If the user asks for changes, explain your plan first.",
+			})
+		}
+		// SLASH COMMAND INTERCEPTION
+		if strings.HasPrefix(input.Content, "/") {
+			cmdParts := strings.Split(input.Content, " ")
+			cmdName := cmdParts[0]
+
+			if c.workflows != nil {
+				if wf, ok := c.workflows.GetWorkflow(cmdName); ok {
+					go func() {
+						// Notify workflow start
+						callback(ChatUpdate{
+							SessionID: input.SessionID,
+							Message: ChatMessage{
+								ID:        uuid.New().String(),
+								Role:      "assistant", // System?
+								Content:   fmt.Sprintf("🚀 Starting workflow: **%s**...", wf.Description),
+								Timestamp: time.Now().UnixMilli(),
+							},
+						})
+
+						// Execute Workflow
+						def := workflow.WorkflowDefinition{
+							Name:        wf.Command,
+							Description: wf.Description,
+							Steps:       wf.Steps,
+						}
+						res, err := c.workflowEngine.Execute(ctx, def, map[string]interface{}{
+							"input": strings.TrimSpace(strings.TrimPrefix(input.Content, cmdName)),
+						})
+
+						if err != nil {
+							callback(ChatUpdate{
+								SessionID: input.SessionID,
+								Message: ChatMessage{
+									ID:        uuid.New().String(),
+									Role:      "assistant",
+									Content:   fmt.Sprintf("❌ Workflow failed: %v", err),
+									Timestamp: time.Now().UnixMilli(),
+								},
+							})
+							return
+						}
+
+						// Summarize results
+						summary := "### Workflow Completed\n"
+						for _, step := range res.History {
+							icon := "✅"
+							if step.Status == "failed" {
+								icon = "❌"
+							}
+							summary += fmt.Sprintf("- %s **%s**: %s\n", icon, step.StepID, truncateString(step.Output, 100))
+						}
+
+						callback(ChatUpdate{
+							SessionID: input.SessionID,
+							Message: ChatMessage{
+								ID:        uuid.New().String(),
+								Role:      "assistant",
+								Content:   summary,
+								Timestamp: time.Now().UnixMilli(),
+							},
+						})
+					}()
+					return nil // Early return, handled by goroutine
+				}
+			}
+		}
+
+		// ─── SMART INJECTIONS (Phase 17) ───
+		expandedContent, infoMsgs := c.injectionProcessor.Process(input.Content)
+		for _, msg := range infoMsgs {
+			callback(ChatUpdate{
+				SessionID: input.SessionID,
+				Message: ChatMessage{
+					ID:        uuid.New().String(),
+					Role:      "assistant", // informational
+					Content:   msg,
+					Timestamp: time.Now().UnixMilli(),
+				},
+			})
+		}
+
 		userMsg := protocol.Message{
 			Role:    "user",
-			Content: input.Content,
+			Content: expandedContent,
 			Via:     input.Via,
 		}
 		session.StateHandler.AddMessage(userMsg)
 	}
 
+	var totalToolCount int
+	var totalTokenCount int
+
 	// Track edited files for task progress
 	taskFiles := make(map[string]bool)
 
-	// Helper to emit task progress
-	emitTaskProgress := func(status string, newFiles []string) {
+	// Extract task name from user input (first 60 chars or until newline)
+	dynamicTaskName := "Processing Request"
+	if input.Content != "" {
+		dynamicTaskName = input.Content
+		if len(dynamicTaskName) > 60 {
+			dynamicTaskName = dynamicTaskName[:60] + "..."
+		}
+		if idx := strings.Index(dynamicTaskName, "\n"); idx > 0 {
+			dynamicTaskName = dynamicTaskName[:idx]
+		}
+	}
+
+	// Accumulated progress steps for Antigravity-style numbered list
+	var accumulatedSteps []string
+	var taskSummary string
+	stepCounter := 0
+
+	// Helper to emit task progress with step accumulation
+	emitTaskProgress := func(status string, newFiles []string, toolCount int, tokenCount int, result string) {
+		totalToolCount += toolCount
+		totalTokenCount += tokenCount
 		// Update file list
 		for _, f := range newFiles {
 			taskFiles[f] = true
@@ -404,20 +588,48 @@ func (c *Controller) Chat(ctx context.Context, input ChatRequestInput, callback 
 			fileList = append(fileList, f)
 		}
 
+		// Accumulate steps with numbering (avoid duplicates)
+		if status != "" && (len(accumulatedSteps) == 0 || accumulatedSteps[len(accumulatedSteps)-1] != status) {
+			stepCounter++
+			accumulatedSteps = append(accumulatedSteps, status)
+		}
+
+		// Generate summary from accumulated work
+		if len(fileList) > 0 {
+			taskSummary = fmt.Sprintf("Edited %d file(s)", len(fileList))
+		} else {
+			taskSummary = status
+		}
+
+		// Map agent mode slugs to protocol modes for UI badges
+		protocolMode := "execution"
+		switch c.modes.GetActiveMode().Slug {
+		case "architect":
+			protocolMode = "planning"
+		case "code":
+			protocolMode = "execution"
+		case "test":
+			protocolMode = "verification"
+		}
+
 		// Construct task payload
 		progress := protocol.TaskProgress{
-			TaskName: "Implementing Feature", // TODO: Determined dynamically
-			Status:   status,
-			Steps:    []string{status},
-			Files:    fileList,
-			IsActive: true,
-			Mode:     "execution",
+			TaskName:   dynamicTaskName,
+			Status:     status,
+			Summary:    taskSummary,
+			Steps:      accumulatedSteps,
+			Files:      fileList,
+			IsActive:   true,
+			Mode:       protocolMode,
+			ToolCount:  totalToolCount,
+			TokenCount: totalTokenCount,
+			Result:     result,
 		}
 
 		// Persist to task_progress_current.md (User Request Parity)
-		// We write this to the workspace root to mimic Antigravity's behavior
 		taskMdContent := fmt.Sprintf("# Task Progress: %s\n\n", progress.TaskName)
 		taskMdContent += fmt.Sprintf("**Status**: %s\n", status)
+		taskMdContent += fmt.Sprintf("**Summary**: %s\n", taskSummary)
 		taskMdContent += fmt.Sprintf("**Mode**: %s\n\n", progress.Mode)
 
 		taskMdContent += "## Files Edited\n"
@@ -430,12 +642,11 @@ func (c *Controller) Chat(ctx context.Context, input ChatRequestInput, callback 
 		}
 
 		taskMdContent += "\n## Progress Log\n"
-		// In a real implementation we would accumulate these steps in state,
-		// but for now we'll just show the latest status as the active step
-		taskMdContent += fmt.Sprintf("- [x] %s\n", status)
+		for i, step := range accumulatedSteps {
+			taskMdContent += fmt.Sprintf("%d. %s\n", i+1, step)
+		}
 
 		// Best effort write - ignore errors to not block flow
-		// Derive workspace root from session or cwd
 		if cwd, err := os.Getwd(); err == nil {
 			_ = os.WriteFile(filepath.Join(cwd, "task_progress_current.md"), []byte(taskMdContent), 0644)
 		}
@@ -443,17 +654,23 @@ func (c *Controller) Chat(ctx context.Context, input ChatRequestInput, callback 
 		callback(progress)
 	}
 
-	// Helper to emit chat updates is already defined below...
+	// Helper to emit chat updates matches the callback signature
 	emitUpdate := func(msg ChatMessage) {
+		msg.SessionID = input.SessionID // Ensure ID is on the message itself
 		callback(ChatUpdate{
 			SessionID: input.SessionID,
 			Message:   msg,
 		})
 	}
 
+	// REMOVED: Unconditional "Starting..." task emission.
+	// This prevents simple chats ("Hi") from creating a task tree node.
+	// Real tasks will trigger progress updates via tools or specific logic steps.
+
 	// MAX TURNS to prevent infinite loops
 	const maxTurns = 50
 	currentTurn := 0
+	stuckCounter := 0 // Counter for consecutive Loop Rule B errors (hard stop after 5)
 
 	// Usage tracking
 	var totalTokensIn int
@@ -480,6 +697,11 @@ func (c *Controller) Chat(ctx context.Context, input ChatRequestInput, callback 
 
 	for currentTurn < maxTurns {
 		currentTurn++
+
+		// LOOP DETECTION: Check if agent is stuck in repetitive pattern
+		// LOOP PATTERN CHECK (Phase 1 - Tool & Error based)
+		// We now check primarily for Tool/Error loops during execution.
+		// Content-based check removed in favor of stricter tool signature checks.
 
 		// Prepare Tools config for provider
 		defs := c.executor.GetDefinitions()
@@ -585,7 +807,13 @@ func (c *Controller) Chat(ctx context.Context, input ChatRequestInput, callback 
 		// If Repomap was appended to finalSystemPrompt, we should use that base.
 
 		// Re-construct system prompt to be safe and ordered
-		enhancedSystemPrompt := finalSystemPrompt + modePrompt + rulesContext + skillContext + "\n\n" + c.envTracker.GetContext() + "\n" + session.FileTracker.GetContext()
+		// Inject project-specific memory if available (Phase 15)
+		memoryContext := c.memoryManager.GetSystemPromptPart()
+
+		// Inject Plan Context (Autonomous Agent)
+		planContext := c.planManager.GenerateContext()
+
+		enhancedSystemPrompt := finalSystemPrompt + modePrompt + memoryContext + rulesContext + skillContext + planContext + "\n\n" + c.envTracker.GetContext() + "\n" + session.FileTracker.GetContext()
 
 		// Use contextResult.Messages as prunedMessages
 		prunedMessages := contextResult.Messages
@@ -708,11 +936,30 @@ func (c *Controller) Chat(ctx context.Context, input ChatRequestInput, callback 
 		const streamThrottleInterval = 50 * time.Millisecond
 		var firstChunk = true // Track first chunk to always emit it
 
+		// LOOP PREVENTION: Content deduplication and reasoning limits
+		var lastEmittedContentLen int   // Track last emitted content length to detect actual changes
+		var lastEmittedReasoningLen int // Track last emitted reasoning length
+		var reasoningChunkCount int     // Count reasoning chunks to prevent infinite thinking
+		const maxReasoningChunks = 500  // Hard limit on reasoning iterations
+		var consecutiveEmptyDeltas int  // Track consecutive empty deltas
+		const maxEmptyDeltas = 10       // Stop if too many empty deltas in a row
+
 		// Stream response from AI using standard ChatStream
 		// We use prunedMessages (from context management) instead of session messages
 		err = c.provider.ChatStream(ctx, req, func(chunk *StreamChunk) error {
 			switch chunk.Type {
 			case "content_block_delta":
+				// LOOP PREVENTION: Check for empty delta spam
+				if len(chunk.Delta) == 0 {
+					consecutiveEmptyDeltas++
+					if consecutiveEmptyDeltas > maxEmptyDeltas {
+						log.Printf("⚠️ Too many empty deltas (%d), possible loop detected", consecutiveEmptyDeltas)
+						return nil // Skip but don't error
+					}
+				} else {
+					consecutiveEmptyDeltas = 0 // Reset counter
+				}
+
 				currentTurnContent += chunk.Delta
 				assistantMsg.Content += chunk.Delta
 				assistantMsg.IsStreaming = true
@@ -720,6 +967,14 @@ func (c *Controller) Chat(ctx context.Context, input ChatRequestInput, callback 
 				// Accumulate reasoning separately for DeepSeek R1 tool call support
 				if chunk.ReasoningDelta != "" {
 					currentTurnReasoning += chunk.ReasoningDelta
+					assistantMsg.Reasoning += chunk.ReasoningDelta
+					reasoningChunkCount++
+
+					// LOOP PREVENTION: Max reasoning guard
+					if reasoningChunkCount > maxReasoningChunks {
+						log.Printf("⚠️ Max reasoning chunks exceeded (%d), forcing completion", reasoningChunkCount)
+						return fmt.Errorf("reasoning limit exceeded - agent may be stuck in thought loop")
+					}
 				}
 
 				// Update Output Tokens - Heuristic
@@ -736,9 +991,17 @@ func (c *Controller) Chat(ctx context.Context, input ChatRequestInput, callback 
 				// BUT always emit: first chunk, thinking tags (reasoning), and after throttle interval
 				now := time.Now()
 				isReasoningTag := strings.Contains(chunk.Delta, "<thinking>") || strings.Contains(chunk.Delta, "</thinking>")
-				if firstChunk || isReasoningTag || now.Sub(lastEmitTime) >= streamThrottleInterval {
+				shouldEmit := firstChunk || isReasoningTag || now.Sub(lastEmitTime) >= streamThrottleInterval
+
+				// LOOP PREVENTION: Only emit if content OR reasoning actually changed
+				contentChanged := len(assistantMsg.Content) > lastEmittedContentLen
+				reasoningChanged := len(assistantMsg.Reasoning) > lastEmittedReasoningLen
+
+				if shouldEmit && (contentChanged || reasoningChanged) {
 					emitUpdate(assistantMsg)
 					lastEmitTime = now
+					lastEmittedContentLen = len(assistantMsg.Content)
+					lastEmittedReasoningLen = len(assistantMsg.Reasoning)
 					firstChunk = false
 				}
 
@@ -770,6 +1033,11 @@ func (c *Controller) Chat(ctx context.Context, input ChatRequestInput, callback 
 			return err
 		}
 
+		// LOOP DETECTION: Track this turn's content
+		if c.loopDetector != nil && currentTurnContent != "" {
+			// LOOP DETECTION: Content check removed. Relying on Tool/Error loop detection.
+		}
+
 		// Store assistant message for this turn in protocol history
 		var storedToolUse []protocol.ToolUseBlock
 		for _, tc := range currentTurnToolCalls {
@@ -795,10 +1063,105 @@ func (c *Controller) Chat(ctx context.Context, input ChatRequestInput, callback 
 		// Initialize QC flag
 		runQC := false
 
+		// ─── BATCH TOOL CONFIRMATION (Phase 19) ───
+		if len(currentTurnToolCalls) > 0 {
+			// ─── PLAN MODE GUARDRAIL: Hard block Write/Execute tools ───
+			var blockedResults []protocol.ToolResultBlock
+			for _, tc := range currentTurnToolCalls {
+				if err := c.validateToolUse(tc.Name, input.PlanMode); err != nil {
+					// Return error to LLM instead of executing - this teaches the agent
+					blockedResults = append(blockedResults, protocol.ToolResultBlock{
+						ToolUseID: tc.ID,
+						Content:   err.Error(),
+						IsError:   true,
+					})
+				}
+			}
+			// If any tools were blocked, send errors back to LLM and continue to next turn
+			if len(blockedResults) > 0 {
+				session.StateHandler.AddMessage(protocol.Message{
+					Role:        "user",
+					ToolResults: blockedResults,
+				})
+				continue // Go to next turn (AI will see the error and adjust)
+			}
+
+			needsApproval := false
+			var summary strings.Builder
+			summary.WriteString("The agent wants to execute the following tools:\n\n")
+
+			for _, tc := range currentTurnToolCalls {
+				if !c.isToolAutoApproved(tc, input.PlanMode) {
+					needsApproval = true
+				}
+				summary.WriteString(fmt.Sprintf("• **%s**\n  %s\n", tc.Name, c.formatToolCall(tc)))
+			}
+
+			if needsApproval {
+				// Pause thinking status if we have one
+				emitTaskProgress("Waiting for approval...", nil, 0, 0, "")
+
+				choices := []string{
+					"Yes",
+					"Yes, and don't ask again for this tool",
+					"No",
+				}
+
+				choiceIdx, err := c.host.AskUserChoice(summary.String(), choices)
+				if err != nil {
+					return fmt.Errorf("approval failed: %w", err)
+				}
+
+				// 0 = Yes
+				// 1 = Yes + Whitelist (runtime only for now)
+				// 2 = No
+
+				if choiceIdx == 2 {
+					// User denied. Send rejection messages for all tools.
+					var toolResults []protocol.ToolResultBlock
+					for _, tc := range currentTurnToolCalls {
+						toolResults = append(toolResults, protocol.ToolResultBlock{
+							ToolUseID: tc.ID,
+							Content:   "User denied execution of this tool.",
+							IsError:   true,
+						})
+					}
+					session.StateHandler.AddMessage(protocol.Message{
+						Role:        "user",
+						ToolResults: toolResults,
+					})
+					continue // Go to next turn (AI will react to rejection)
+				}
+
+				if choiceIdx == 1 {
+					// Whitelist the tools in this batch
+					for _, tc := range currentTurnToolCalls {
+						if c.config.AutoApproval != nil {
+							// Naive runtime whitelist: just toggle the broad category if applicable?
+							// Better: we can't easily persist fine-grained rules yet without config overhaul.
+							// For now, let's just enable the category for this session.
+							switch tc.Name {
+							case "read_file", "list_dir":
+								c.config.AutoApproval.ReadFiles = true
+							case "execute_command":
+								c.config.AutoApproval.ExecuteSafeCommands = true
+							}
+						}
+					}
+				}
+			}
+		}
+
 		// EXECUTE TOOLS
 		log.Printf("Executing %d tools...", len(currentTurnToolCalls))
 		var toolResults []protocol.ToolResultBlock
 		for i, tc := range currentTurnToolCalls {
+			// Prettify tool name for progress
+			// Prettify tool name for progress
+			friendlyTool := c.formatToolCall(tc)
+			// Use friendlyTool as the status so it shows up nicely in the tree
+			emitTaskProgress(friendlyTool, nil, 0, 0, "")
+
 			// Update status to running in both turn list and message list
 			currentTurnToolCalls[i].Status = "running"
 			for j := range assistantMsg.ToolCalls {
@@ -815,53 +1178,137 @@ func (c *Controller) Chat(ctx context.Context, input ChatRequestInput, callback 
 			var result string
 			var err error
 
-			switch tc.Name {
-			case "update_todos":
-				var payload struct {
-					Todos []protocol.Todo `json:"todos"`
+			// LOOP DETECTOR: Rule A (Stupidity Check)
+			if c.loopDetector != nil {
+				if loopErr := c.loopDetector.CheckTool(tc.Name, tc.Arguments); loopErr != nil {
+					log.Printf("🛑 Loop Rule A: %v", loopErr)
+					err = loopErr
+					// We act as if execution failed immediately
 				}
-				if err = json.Unmarshal([]byte(tc.Arguments), &payload); err == nil {
-					c.UpdateTodos(input.SessionID, payload.Todos)
-					result = "Task list updated successfully."
-				} else {
-					result = fmt.Sprintf("Error parsing todos: %v", err)
-				}
-			case "switch_mode":
-				var payload struct {
-					Mode    string `json:"mode"`
-					Handoff bool   `json:"handoff"`
-				}
-				if err = json.Unmarshal([]byte(tc.Arguments), &payload); err == nil {
-					// 1. Execute mode switch
-					result, err = c.executor.Execute(ctx, tc.Name, json.RawMessage(tc.Arguments))
-					if err == nil && payload.Handoff {
-						// 2. Trigger Handoff
-						log.Printf("🧠 Triggering Intelligent Handoff...")
-						cwd, _ := os.Getwd()
+			}
 
-						// Summarize history (exclude current tool call)
-						msgs := session.StateHandler.GetMessages()
-						spec, hErr := c.handoffService.GenerateSpec(ctx, msgs)
-						if hErr != nil {
-							log.Printf("Handoff generation failed: %v", hErr)
-							result += fmt.Sprintf("\n(Warning: Handoff failed: %v)", hErr)
-						} else {
-							sErr := c.handoffService.SaveSpec(cwd, spec)
-							if sErr != nil {
-								log.Printf("Handoff save failed: %v", sErr)
+			// HOOKIFY: Dynamic Safety Checks
+			if c.dynamicHooks != nil {
+				var hookArgs map[string]interface{}
+				if json.Unmarshal([]byte(tc.Arguments), &hookArgs) == nil {
+					warnMsg, blockErr := c.dynamicHooks.CheckPreToolUse(tc.Name, hookArgs)
+					if blockErr != nil {
+						err = blockErr
+						log.Printf("🚫 Hook Action Blocked: %v", err)
+					} else if warnMsg != "" {
+						log.Printf("⚠️ Hook Warning: %s", warnMsg)
+						// Inject warning into the result effectively
+						result = fmt.Sprintf("[HOOK WARNING] %s\n\n", warnMsg)
+					}
+				}
+			}
+
+			if err == nil {
+				switch tc.Name {
+				case "update_todos":
+					var payload struct {
+						Todos []protocol.Todo `json:"todos"`
+					}
+					if err = json.Unmarshal([]byte(tc.Arguments), &payload); err == nil {
+						c.UpdateTodos(input.SessionID, payload.Todos)
+						result = "Task list updated successfully."
+					} else {
+						result = fmt.Sprintf("Error parsing todos: %v", err)
+					}
+				case "task_boundary":
+					var payload struct {
+						TaskName          string `json:"TaskName"`
+						Mode              string `json:"Mode"`
+						TaskSummary       string `json:"TaskSummary"`
+						TaskStatus        string `json:"TaskStatus"`
+						PredictedTaskSize int    `json:"PredictedTaskSize"`
+					}
+					if err = json.Unmarshal([]byte(tc.Arguments), &payload); err == nil {
+						// 1. Update dynamic task name
+						if payload.TaskName != "" && payload.TaskName != "%SAME%" {
+							dynamicTaskName = payload.TaskName
+						}
+						// 2. Update mode if changed
+						if payload.Mode != "" && payload.Mode != "%SAME%" {
+							newMode := strings.ToLower(payload.Mode)
+							// Map protocol modes back to agent slugs if needed
+							switch newMode {
+							case "planning":
+								newMode = "architect"
+							case "execution":
+								newMode = "code"
+							case "verification":
+								newMode = "test"
+							}
+							c.modes.SetMode(newMode)
+							log.Printf("🔄 Mode switched via task_boundary: %s (agent mode: %s)", payload.Mode, newMode)
+						}
+						// 3. Update summary if changed
+						if payload.TaskSummary != "" && payload.TaskSummary != "%SAME%" {
+							taskSummary = payload.TaskSummary
+						}
+						// 4. Emit progress update with the new status
+						status := payload.TaskStatus
+						if status == "%SAME%" {
+							status = "" // Don't add a new step if status is same
+						}
+						emitTaskProgress(status, nil, 0, 0, "")
+						result = "Task boundary updated."
+					} else {
+						result = fmt.Sprintf("Error parsing task_boundary args: %v", err)
+					}
+				case "switch_mode":
+					var payload struct {
+						Mode    string `json:"mode"`
+						Handoff bool   `json:"handoff"`
+					}
+					if err = json.Unmarshal([]byte(tc.Arguments), &payload); err == nil {
+						// 1. Execute mode switch
+						result, err = c.executor.Execute(ctx, tc.Name, json.RawMessage(tc.Arguments))
+						if err == nil && payload.Handoff {
+							// 2. Trigger Handoff
+							log.Printf("🧠 Triggering Intelligent Handoff...")
+							cwd, _ := os.Getwd()
+
+							// Summarize history (exclude current tool call)
+							msgs := session.StateHandler.GetMessages()
+							spec, hErr := c.handoffService.GenerateSpec(ctx, msgs)
+							if hErr != nil {
+								log.Printf("Handoff generation failed: %v", hErr)
+								result += fmt.Sprintf("\n(Warning: Handoff failed: %v)", hErr)
 							} else {
-								// 3. Condense Context: Re-initialize session but keep ID
-								// For now, we just log it. Real pruning happens in ContextManager anyway.
-								// But to "Start Fresh", we could archive messages.
-								result += "\n\n🧠 **Intelligent Handoff Complete**\nContext condensed into `SPEC.md`. Mode switched."
+								sErr := c.handoffService.SaveSpec(cwd, spec)
+								if sErr != nil {
+									log.Printf("Handoff save failed: %v", sErr)
+								} else {
+									// 3. Condense Context: Re-initialize session but keep ID
+									// For now, we just log it. Real pruning happens in ContextManager anyway.
+									// But to "Start Fresh", we could archive messages.
+									result += "\n\n🧠 **Intelligent Handoff Complete**\nContext condensed into `SPEC.md`. Mode switched."
+								}
 							}
 						}
+					} else {
+						result = fmt.Sprintf("Error parsing switch_mode args: %v", err)
 					}
-				} else {
-					result = fmt.Sprintf("Error parsing switch_mode args: %v", err)
+				case "update_plan":
+					var payload struct {
+						TaskID string `json:"task_id"`
+						Status string `json:"status"`
+					}
+					if err = json.Unmarshal([]byte(tc.Arguments), &payload); err == nil {
+						if upErr := c.planManager.UpdateTask(payload.TaskID, payload.Status); upErr != nil {
+							result = fmt.Sprintf("Failed to update plan: %v", upErr)
+						} else {
+							result = fmt.Sprintf("Started 'update_plan' for task %s -> %s. Plan persisted.", payload.TaskID, payload.Status)
+							// Trigger a system prompt refresh roughly by context management
+						}
+					} else {
+						result = fmt.Sprintf("Error parsing update_plan args: %v", err)
+					}
+				default:
+					result, err = c.executor.Execute(ctx, tc.Name, json.RawMessage(tc.Arguments))
 				}
-			default:
-				result, err = c.executor.Execute(ctx, tc.Name, json.RawMessage(tc.Arguments))
 			}
 			isError := false
 			if err != nil {
@@ -869,8 +1316,28 @@ func (c *Controller) Chat(ctx context.Context, input ChatRequestInput, callback 
 				result = TranslateError(err)
 				isError = true
 				currentTurnToolCalls[i].Status = "error"
+
+				// LOOP DETECTOR: Rule B (Insanity Check)
+				if c.loopDetector != nil {
+					if loopErr := c.loopDetector.CheckError(result); loopErr != nil {
+						log.Printf("🛑 Loop Rule B: %v", loopErr)
+						stuckCounter++
+						result += fmt.Sprintf("\n\nCRITICAL: %v", loopErr)
+
+						// HARD STOP: Force-break after 5 consecutive stuck errors
+						if stuckCounter >= 5 {
+							log.Printf("🛑 HARD STOP: Agent stuck in infinite loop (%d consecutive errors). Aborting.", stuckCounter)
+							assistantMsg.Content = "🛑 Agent was stuck in an infinite loop and has been stopped. Please try a different approach or restart the conversation."
+							assistantMsg.IsStreaming = false
+							emitUpdate(assistantMsg)
+							return fmt.Errorf("agent stuck: loop detected %d times consecutively", stuckCounter)
+						}
+						err = loopErr
+					}
+				}
 			} else {
 				currentTurnToolCalls[i].Status = "completed"
+				stuckCounter = 0 // Reset stuck counter on successful tool execution
 			}
 
 			displayResult := truncateString(result, 1000)
@@ -890,6 +1357,10 @@ func (c *Controller) Chat(ctx context.Context, input ChatRequestInput, callback 
 				Content:   result,
 				IsError:   isError,
 			})
+
+			// Emitting result for TUI high-fidelity output
+			// Re-emit with the same friendly name so it updates the same node (or appends, tree logic handles it)
+			emitTaskProgress(friendlyTool, nil, 1, 0, result)
 
 			// Track activities for the UI
 			if !isError {
@@ -926,17 +1397,30 @@ func (c *Controller) Chat(ctx context.Context, input ChatRequestInput, callback 
 					}
 
 					if target != "" {
-						emitTaskProgress(fmt.Sprintf("Edited %s", path.Base(target)), []string{target})
+						emitTaskProgress(fmt.Sprintf("Edited %s", filepath.Base(target)), []string{target}, 0, 0, "")
 					}
 				}
 			}
 
-			// Auto-checkpoint after write operations
-			if !isError && c.checkpointService != nil && isWriteTool(tc.Name) {
-				hash, cpErr := c.checkpointService.Save(fmt.Sprintf("After %s", tc.Name))
-				if cpErr == nil && hash != "" {
-					assistantMsg.CheckpointHash = hash
-					log.Printf("📸 Checkpoint saved: %s (after %s)", hash[:8], tc.Name)
+			// Auto-checkpoint after write operations (Phase 18)
+			if !isError && c.checkpointManager != nil && isWriteTool(tc.Name) {
+				// Detect target file for specific snapshot
+				var targetFiles []string
+				var argsMap map[string]interface{}
+				if json.Unmarshal([]byte(tc.Arguments), &argsMap) == nil {
+					if t, ok := argsMap["TargetFile"].(string); ok {
+						targetFiles = append(targetFiles, t)
+					} else if t, ok := argsMap["path"].(string); ok {
+						targetFiles = append(targetFiles, t)
+					} else if t, ok := argsMap["AbsolutePath"].(string); ok {
+						targetFiles = append(targetFiles, t)
+					}
+				}
+
+				cpID, cpErr := c.checkpointManager.Save(fmt.Sprintf("Auto: After %s", tc.Name), targetFiles)
+				if cpErr == nil && cpID != "" {
+					assistantMsg.CheckpointHash = cpID
+					log.Printf("📸 Auto-Checkpoint saved: %s (after %s)", cpID[:8], tc.Name)
 				}
 			}
 
@@ -1003,32 +1487,63 @@ func (c *Controller) sanitizeMessages(msgs []protocol.Message) []protocol.Messag
 		if msg.Role == "assistant" && len(msg.ToolUse) > 0 {
 			// Check next message
 			if i+1 >= len(msgs) {
-				// Dangling tool call at end of history -> Drop it
-				log.Printf("⚠️ Sanitizer: Dropping dangling tool call at end of history (ID: %s)", msg.ToolUse[0].ID)
+				// Dangling tool call at end of history
+				// Instead of dropping, append a placeholder result to finalize the turn
+				log.Printf("⚠️ Sanitizer: Fixing dangling tool call at end (ID: %s)", msg.ToolUse[0].ID)
+				clean = append(clean, msg)
+				clean = append(clean, protocol.Message{
+					Role: "user",
+					ToolResults: []protocol.ToolResultBlock{{
+						ToolUseID: msg.ToolUse[0].ID,
+						Content:   "Tool execution interrupted or result lost.",
+						IsError:   true,
+					}},
+				})
 				continue
 			}
 
 			nextMsg := msgs[i+1]
 			if nextMsg.Role != "user" || len(nextMsg.ToolResults) == 0 {
-				// Next message is NOT a result -> Drop this tool call
-				log.Printf("⚠️ Sanitizer: Dropping orphaned tool call (ID: %s) followed by %s", msg.ToolUse[0].ID, nextMsg.Role)
+				// Next message is NOT a result (e.g., User text or another Assistant msg)
+				// We MUST provide a result for the tool call to be valid.
+				log.Printf("⚠️ Sanitizer: Injecting missing result for tool call (ID: %s) followed by %s", msg.ToolUse[0].ID, nextMsg.Role)
+
+				// Keep the tool call
+				clean = append(clean, msg)
+
+				// Create synthetic result
+				syntheticResult := protocol.ToolResultBlock{
+					ToolUseID: msg.ToolUse[0].ID,
+					Content:   "Tool execution result missing (interrupted or lost).",
+					IsError:   true,
+				}
+
+				// If next is User message, merge the synthetic result into it
+				if nextMsg.Role == "user" {
+					// Merge
+					nextMsg.ToolResults = append([]protocol.ToolResultBlock{syntheticResult}, nextMsg.ToolResults...)
+					clean = append(clean, nextMsg)
+					skipNext = true
+				} else {
+					// Insert separate User message with result
+					clean = append(clean, protocol.Message{
+						Role:        "user",
+						ToolResults: []protocol.ToolResultBlock{syntheticResult},
+					})
+					// Do NOT skip next (process it as normal next message)
+				}
 				continue
 			}
 
-			// Optional: Verify IDs match?
-			// DeepSeek expects strict ID matching.
-			// Let's assume if it follows, it's correct enough for now.
-			// But if we want to be safe, we should check.
-
-			// Keep both
+			// Valid Pair: Assistant(Tool) -> User(Result)
 			clean = append(clean, msg)
 			clean = append(clean, nextMsg)
-			skipNext = true // Consumed nextMsg
+			skipNext = true
 			continue
 		}
 
-		// Determine if this is an orphan Tool Result (User message with results but no preceding call)
-		// Since we handle pairs above, if we see a User with Results here, it means we skipped the call!
+		// Drop orphan tool results (User msg with results but no preceding call)
+		// This happens if we dropped the call, or if history is corrupted.
 		if msg.Role == "user" && len(msg.ToolResults) > 0 {
 			log.Printf("⚠️ Sanitizer: Dropping orphan tool result (ID: %s)", msg.ToolResults[0].ToolUseID)
 			continue
@@ -1043,6 +1558,14 @@ func (c *Controller) sanitizeMessages(msgs []protocol.Message) []protocol.Messag
 // GetState returns the current state for a session
 func (c *Controller) GetState(sessionID string) map[string]interface{} {
 	session := c.GetSession(sessionID)
+	if session == nil {
+		return map[string]interface{}{
+			"messages":        []interface{}{},
+			"liveModeEnabled": false,
+			"mode":            "code",
+			"todos":           []protocol.Todo{},
+		}
+	}
 
 	stateMsgs := session.StateHandler.GetMessages()
 	messages := make([]ChatMessage, 0)
@@ -1171,6 +1694,14 @@ func (c *Controller) deriveActivity(name string, arguments string, result string
 			activity.Type = "analyze"
 			activity.File = path
 		}
+	case "task_boundary":
+		activity.Type = "task_boundary"
+		if tn, ok := argsMap["TaskName"].(string); ok {
+			activity.File = tn
+		}
+		if ts, ok := argsMap["TaskStatus"].(string); ok {
+			activity.Message = ts
+		}
 	case "write_file", "edit_file", "replace_file_content", "multi_replace_file_content":
 		if path, ok := argsMap["TargetFile"].(string); ok {
 			activity.Type = "edit"
@@ -1264,11 +1795,11 @@ func isWriteTool(name string) bool {
 	return writingTools[name]
 }
 
-// SetCheckpointService sets the checkpoint service for auto-saving
-func (c *Controller) SetCheckpointService(svc *checkpoints.CheckpointService) {
+// SetCheckpointManager sets the checkpoint manager for auto-saving
+func (c *Controller) SetCheckpointManager(mgr *CheckpointManager) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.checkpointService = svc
+	c.checkpointManager = mgr
 }
 
 // normalizeModeName converts mode names to match ephemeral message expectations
@@ -1288,4 +1819,239 @@ func normalizeModeName(modeName string) string {
 		// Default: code mode
 		return "code"
 	}
+}
+
+// Execute implements workflow.AgentExecutor interface
+// It allows the workflow engine to trigger agent actions
+func (c *Controller) formatToolCall(tc ToolCallInfo) string {
+	var args map[string]interface{}
+	// If unmarshal fails, return raw string to avoid hiding info
+	if err := json.Unmarshal([]byte(tc.Arguments), &args); err != nil {
+		return tc.Arguments
+	}
+
+	// Helper to get string from map with multiple possible keys
+	getStr := func(keys ...string) (string, bool) {
+		for _, k := range keys {
+			if v, ok := args[k].(string); ok {
+				return v, true
+			}
+		}
+		return "", false
+	}
+
+	switch tc.Name {
+	case "read_file", "view_file", "view_file_outline":
+		if path, ok := getStr("path", "AbsolutePath", "file", "target"); ok {
+			return fmt.Sprintf("Read file **%s**", path)
+		}
+	case "list_dir":
+		if path, ok := getStr("DirectoryPath", "path", "dir"); ok {
+			return fmt.Sprintf("List directory **%s**", path)
+		}
+	case "write_file", "write_to_file":
+		if path, ok := getStr("path", "TargetFile", "file"); ok {
+			return fmt.Sprintf("Write to file **%s**", path)
+		}
+	case "replace_file_content", "multi_replace_file_content":
+		if path, ok := getStr("TargetFile", "path", "file"); ok {
+			return fmt.Sprintf("Edit file **%s**", path)
+		}
+	case "execute_command", "run_command":
+		if cmd, ok := getStr("command", "CommandLine", "cmd"); ok {
+			return fmt.Sprintf("Run command: `%s`", cmd)
+		}
+	case "grep_search":
+		if q, ok := getStr("Query", "query", "pattern"); ok {
+			return fmt.Sprintf("Search for \"%s\"", q)
+		}
+	case "codebase_search":
+		if q, ok := getStr("Query", "query"); ok {
+			return fmt.Sprintf("Semantic search: \"%s\"", q)
+		}
+	case "task_boundary":
+		// Return empty string to HIDE this from the visual tree
+		// The TUI listens to the actual event, so we don't need a tree node for the tool call itself
+		return ""
+	case "update_todos", "get_context_stats":
+		return ""
+	}
+
+	// Fallback: try to find a meaningful "path" or "command" generic key
+	if p, ok := getStr("path", "file"); ok {
+		return fmt.Sprintf("%s **%s**", tc.Name, p)
+	}
+
+	return tc.Arguments
+}
+
+func (c *Controller) Execute(ctx context.Context, prompt string) (string, error) {
+	// Create a temporary session for this step execution
+	session := c.CreateSession()
+
+	req := ChatRequestInput{
+		SessionID: session.ID,
+		Content:   prompt,
+		Via:       "workflow_engine",
+	}
+
+	var responseBuilder strings.Builder
+	var mu sync.Mutex
+
+	// Helper to collect response
+	err := c.Chat(ctx, req, func(update interface{}) {
+		if cu, ok := update.(ChatUpdate); ok {
+			if cu.Message.Role == "assistant" && cu.Message.Content != "" {
+				mu.Lock()
+				responseBuilder.WriteString(cu.Message.Content)
+				mu.Unlock()
+			}
+		}
+	})
+
+	if err != nil {
+		return "", err
+	}
+
+	return responseBuilder.String(), nil
+}
+
+// GetMemory returns the current persistent memory
+func (c *Controller) GetMemory() (string, error) {
+	return c.memoryManager.Load()
+}
+
+// AddMemory appends a new entry to persistent memory
+func (c *Controller) AddMemory(content string) error {
+	return c.memoryManager.Add(content)
+}
+
+// ClearMemory wipes the persistent memory
+func (c *Controller) ClearMemory() error {
+	return c.memoryManager.Clear()
+}
+
+// GetActiveHooks returns a list of active dynamic hooks
+func (c *Controller) GetActiveHooks() []string {
+	if c.dynamicHooks == nil {
+		return nil
+	}
+	hooks := c.dynamicHooks.ListHooks()
+	result := make([]string, len(hooks))
+	for i, h := range hooks {
+		result[i] = fmt.Sprintf("%s (%s)", h.Name, h.Event)
+	}
+	return result
+}
+
+// InitProject performs automated discovery and populates memory
+func (c *Controller) InitProject(ctx context.Context) (string, error) {
+	scanner := NewProjectScanner(c.envTracker.GetCwd(), c)
+	summary, err := scanner.ScanProject(ctx)
+	if err != nil {
+		return "", err
+	}
+
+	// Save to memory
+	err = c.memoryManager.Save(summary)
+	if err != nil {
+		return "", fmt.Errorf("failed to save memory: %w", err)
+	}
+
+	return summary, nil
+}
+
+// --- Checkpoint Management (Phase 18) ---
+
+// SaveCheckpoint creates a manual snapshot of current workspace files
+func (c *Controller) SaveCheckpoint(name string, files []string) (string, error) {
+	return c.checkpointManager.Save(name, files)
+}
+
+// ListCheckpoints returns all project snapshots
+func (c *Controller) ListCheckpoints() ([]Checkpoint, error) {
+	return c.checkpointManager.List()
+}
+
+// RestoreCheckpoint reverts project to a specific state
+func (c *Controller) RestoreCheckpoint(idOrName string) error {
+	return c.checkpointManager.Restore(idOrName)
+}
+
+// isToolAutoApproved checks if a tool call can proceed without manual confirmation.
+// Uses Category-Based Permission System instead of hardcoded tool name lists.
+func (c *Controller) isToolAutoApproved(tc ToolCallInfo, planMode bool) bool {
+	category := tools.GetToolCategory(tc.Name)
+
+	// ─── META TOOLS: ALWAYS ALLOW (Silent) ───
+	// These tools have no side effects on the project files or system.
+	if category == tools.CategoryMeta {
+		return true
+	}
+
+	// ─── READ TOOLS: ALWAYS ALLOW (Silent) ───
+	// Read-only operations should NEVER interrupt the user's flow.
+	// This is unconditional - reading files is always safe.
+	if category == tools.CategoryRead {
+		return true
+	}
+
+	// ─── WRITE TOOLS: Plan Mode = BLOCKED, Act Mode = AUTO-APPROVE ───
+	if category == tools.CategoryWrite {
+		if planMode {
+			// In Plan Mode, write tools are blocked (handled by validateToolUse)
+			return false
+		}
+		// ACT MODE: Auto-approve write operations
+		return true
+	}
+
+	// ─── EXECUTE TOOLS: Plan Mode = BLOCKED, Act Mode = AUTO-APPROVE ───
+	if category == tools.CategoryExecute {
+		if planMode {
+			// In Plan Mode, execute tools are blocked
+			return false
+		}
+		// ACT MODE: Auto-approve command execution
+		return true
+	}
+
+	// ─── BROWSER TOOLS: Plan Mode = ASK, Act Mode = AUTO-APPROVE ───
+	if category == tools.CategoryBrowser {
+		if planMode {
+			// In Plan Mode, browser tools require explicit approval
+			if c.config.AutoApproval != nil && c.config.AutoApproval.UseBrowser {
+				return true
+			}
+			return false
+		}
+		// ACT MODE: Auto-approve browser operations
+		return true
+	}
+
+	// ─── MCP / UNKNOWN TOOLS: Default to requiring approval ───
+	// Safety first for external/unknown tools
+	return false
+}
+
+// validateToolUse implements the Plan Mode Guardrail.
+// Returns error if Write/Execute tools are attempted in Plan Mode.
+func (c *Controller) validateToolUse(toolName string, planMode bool) error {
+	category := tools.GetToolCategory(toolName)
+
+	// STRICT RULE: No side effects in Plan Mode
+	if planMode {
+		if category == tools.CategoryWrite {
+			return fmt.Errorf("⚠️ Action denied: Tool '%s' (category: %s) is forbidden in PLAN MODE. Please switch to Act Mode using 'switch_mode' or complete your planning phase.", toolName, category)
+		}
+		if category == tools.CategoryExecute {
+			return fmt.Errorf("⚠️ Action denied: Tool '%s' (category: %s) is forbidden in PLAN MODE. Shell commands require Act Mode.", toolName, category)
+		}
+	}
+	return nil
+}
+
+// GetSafeguard returns the safeguard manager
+func (c *Controller) GetSafeguard() *safeguard.Manager {
+	return c.safeguard
 }

@@ -13,6 +13,8 @@ import (
 	"syscall"
 	"time"
 
+	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 	"github.com/gorilla/websocket"
 	"github.com/igoryan-dao/ricochet/internal/agent"
 	"github.com/igoryan-dao/ricochet/internal/codegraph"
@@ -24,7 +26,10 @@ import (
 	"github.com/igoryan-dao/ricochet/internal/prompts"
 	"github.com/igoryan-dao/ricochet/internal/protocol"
 	"github.com/igoryan-dao/ricochet/internal/server"
+	"github.com/igoryan-dao/ricochet/internal/tui"
 	"github.com/igoryan-dao/ricochet/internal/workflow"
+	"github.com/mattn/go-isatty"
+	"github.com/muesli/termenv"
 )
 
 var (
@@ -127,8 +132,15 @@ var upgrader = websocket.Upgrader{
 }
 
 func main() {
+	// Force TrueColor for TUI - fixes ANSI artifacts in some VTs
+	lipgloss.SetColorProfile(termenv.TrueColor)
+
 	log.SetPrefix("[ricochet-core] ")
 	log.SetOutput(os.Stderr)
+
+	fmt.Println("\n\n********************************************************")
+	fmt.Println("* RICOCHET CORE v2.0 - BUILD UPDATED: 2026-01-19 21:38 *")
+	fmt.Println("********************************************************")
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -169,6 +181,7 @@ func main() {
 		MaxTokens:       4096, // Max tokens for response
 		ContextWindow:   128000,
 		EnableCodeIndex: settings.Context.EnableCodeIndex,
+		AutoApproval:    &settings.AutoApproval,
 	}
 
 	// Configure Embedding Provider if one is specified
@@ -197,6 +210,7 @@ func main() {
 	isServer := false
 	port := "5555"
 	isStdio := false
+	forceTui := false
 
 	for i := 0; i < len(args); i++ {
 		if args[i] == "--server" {
@@ -206,6 +220,8 @@ func main() {
 			i++
 		} else if args[i] == "--stdio" {
 			isStdio = true
+		} else if args[i] == "--tui" {
+			forceTui = true
 		}
 	}
 
@@ -213,8 +229,11 @@ func main() {
 		runServerMode(ctx, cwd, port)
 	} else if isStdio {
 		runStdioMode(ctx, cwd)
+	} else if forceTui || (len(args) == 0 && isatty.IsTerminal(os.Stdout.Fd()) && isatty.IsTerminal(os.Stdin.Fd())) {
+		// Default to Interactive Mode if TTY detected OR forced
+		runInteractiveMode(ctx, cwd)
 	} else {
-		// Default to MCP mode if no args, or handle as needed
+		// Default to MCP mode if no args and not TTY, or handle as needed
 		runMCPMode(ctx)
 	}
 }
@@ -510,4 +529,141 @@ func sendMessage(msg interface{}) {
 		return
 	}
 	fmt.Printf("%s\n", data)
+}
+
+// runInteractiveMode launches the TUI agent
+func runInteractiveMode(_ context.Context, cwd string) {
+	// Redirect logs to file to avoid messing up TUI
+	f, err := os.OpenFile("ricochet.log", os.O_RDWR|os.O_CREATE|os.O_APPEND, 0666)
+	if err == nil {
+		log.SetOutput(f)
+		defer f.Close()
+	} else {
+		log.SetOutput(new(devNull))
+	}
+
+	msgChan := make(chan tea.Msg, 100)
+	tuiHost := tui.NewTuiHost(cwd, msgChan)
+
+	// Create Agent Controller
+	// We reuse main's cfg if possible, but simpler to recreate or pass it in.
+	// For simplicity, let's rely on standard config loading inside NewController (partial duplication but safe)
+
+	settingsStore, _ := config.NewStore()
+	settings := settingsStore.Get()
+	cfg := &agent.Config{
+		Provider: agent.ProviderConfig{
+			Provider: settings.Provider.Provider,
+			Model:    settings.Provider.Model,
+			APIKey:   settings.Provider.APIKey,
+		},
+		SystemPrompt:  prompts.BuildSystemPrompt(cwd), // Updated to use prompts package
+		MaxTokens:     4096,
+		ContextWindow: 128000,
+		AutoApproval:  &settings.AutoApproval,
+	}
+
+	// FORCE-ENABLE read ops for better UX (ignoring stale config if needed)
+	cfg.AutoApproval.Enabled = true
+	cfg.AutoApproval.ReadFiles = true
+	cfg.AutoApproval.ReadFilesExternal = false  // Keep this safe
+	cfg.AutoApproval.ExecuteSafeCommands = true // Allow ls, cat etc
+
+	if settings.Provider.EmbeddingProvider != "" {
+		embKey := settings.Provider.APIKeys[settings.Provider.EmbeddingProvider]
+		if embKey == "" && settings.Provider.Provider == settings.Provider.EmbeddingProvider {
+			embKey = settings.Provider.APIKey
+		}
+
+		cfg.EmbeddingProvider = &agent.ProviderConfig{
+			Provider: settings.Provider.EmbeddingProvider,
+			Model:    settings.Provider.EmbeddingModel,
+			APIKey:   embKey,
+		}
+	}
+
+	// Helper to handle API Keys map
+	if cfg.Provider.APIKey == "" && len(settings.Provider.APIKeys) > 0 {
+		// Try to fallback
+		if k, ok := settings.Provider.APIKeys[cfg.Provider.Provider]; ok {
+			cfg.Provider.APIKey = k
+		}
+	}
+
+	opts := agent.ControllerOptions{
+		Host: tuiHost,
+	}
+
+	controller, err := agent.NewController(cfg, opts)
+	if err != nil {
+		fmt.Printf("Failed to initialize agent (check connection/keys): %v\n", err)
+		os.Exit(1)
+	}
+
+	// Initialize Live Mode if configured
+	var liveCtrl *livemode.Controller
+	if settings.LiveMode.TelegramToken != "" {
+		liveConfig := &livemode.Config{
+			TelegramToken:  settings.LiveMode.TelegramToken,
+			TelegramChatID: settings.LiveMode.TelegramChatID,
+		}
+
+		// Re-use err
+		liveCtrl, err = livemode.New(liveConfig, nil)
+		if err != nil {
+			fmt.Printf("Warning: Failed to create LiveMode controller: %v\n", err)
+		} else {
+			// Wire Callbacks
+			liveCtrl.SetAgent(controller)
+
+			// 1. Output Mirroring (Agent -> Telegram) AND (Telegram -> TUI)
+			liveCtrl.SetOnChatUpdate(func(update agent.ChatUpdate) {
+				// Filter out technical updates (ContextStatus) that have no message content/role
+				if update.Message.Role == "" && update.Message.Content == "" {
+					return
+				}
+				log.Printf("[MAIN] Forwarding ChatUpdate to TUI: %d chars", len(update.Message.Content))
+				msgChan <- tui.RemoteChatMsg{Message: update.Message}
+			})
+
+			// 2. Input Control (Telegram -> TUI)
+			liveCtrl.SetOnUserMessage(func(msg string) {
+				msgChan <- tui.RemoteInputMsg{Content: msg}
+			})
+
+			// 3. Task Progress (Agent -> TUI)
+			liveCtrl.SetOnTaskProgress(func(progress protocol.TaskProgress) {
+				msgChan <- progress
+			})
+
+			// Start background polling
+			liveCtrl.Start(context.Background())
+		}
+	}
+
+	// Pass controller to model
+	// m := tui.NewModel(cwd, cfg.Provider.Model, msgChan, controller)
+	// We need to inject liveCtrl into model if possible, or let model handle it via controller?
+	// The Model struct has LiveCtrl field.
+
+	m := tui.NewModel(cwd, cfg.Provider.Model, msgChan, controller)
+	m.LiveCtrl = liveCtrl
+	if liveCtrl != nil {
+		m.IsEtherMode = true
+		// BINDING FIX: Tell LiveMode about the TUI's session
+		liveCtrl.SetMainSessionID(m.SessionID)
+	}
+	m.SettingsStore = settingsStore
+
+	p := tea.NewProgram(m, tea.WithAltScreen())
+	if _, err := p.Run(); err != nil {
+		fmt.Printf("Error running Ricochet TUI: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+type devNull struct{}
+
+func (d *devNull) Write(p []byte) (n int, err error) {
+	return len(p), nil
 }
