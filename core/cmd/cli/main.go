@@ -89,14 +89,19 @@ func startChat() {
 			var payload map[string]interface{}
 			_ = json.Unmarshal(msg.Payload, &payload)
 
-			if content, ok := payload["message"].(string); ok {
-				// Basic incremental printing
-				if len(content) > lastLength {
-					chunk := content[lastLength:]
-					fmt.Print(chunk)
-					fullContent.WriteString(chunk)
-					lastLength = len(content)
+			if msgData, ok := payload["message"].(map[string]interface{}); ok {
+				if content, ok := msgData["content"].(string); ok {
+					// Basic incremental printing
+					if len(content) > lastLength {
+						chunk := content[lastLength:]
+						fmt.Print(chunk)
+						fullContent.WriteString(chunk)
+						lastLength = len(content)
+					}
 				}
+
+				// Optional: Render Tool Calls / Activities dynamically?
+				// For now just streaming content is enough for MVP.
 			}
 
 		case "response":

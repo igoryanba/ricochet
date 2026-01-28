@@ -81,6 +81,7 @@ var toolCategoryRegistry = map[string]ToolCategory{
 	"switch_mode":     CategoryMeta,
 	"ask_user_choice": CategoryMeta, // User interaction tool
 	"notify_user":     CategoryMeta,
+	"start_swarm":     CategoryMeta,
 
 	// ─── BROWSER TOOLS ───
 	"browser_open":       CategoryBrowser,

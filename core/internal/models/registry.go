@@ -46,9 +46,9 @@ var Registry = map[string]ProviderInfo{
 		ID:   "openai",
 		Name: "OpenAI",
 		Models: []ModelInfo{
-			{ID: "gpt-4o", Name: "GPT-4o", Provider: "openai", ContextWindow: 128000, InputPrice: 2.5, OutputPrice: 10.0, IsFree: false, SupportsTools: true, Description: "Latest GPT-4"},
-			{ID: "gpt-4o-mini", Name: "GPT-4o mini", Provider: "openai", ContextWindow: 128000, InputPrice: 0.15, OutputPrice: 0.60, IsFree: false, SupportsTools: true, Description: "Fast & cheap"},
-			{ID: "o1", Name: "o1", Provider: "openai", ContextWindow: 128000, InputPrice: 15.0, OutputPrice: 60.0, IsFree: false, SupportsTools: false, Description: "Reasoning model"},
+			{ID: "gpt-5.2", Name: "GPT-5.2", Provider: "openai", ContextWindow: 200000, InputPrice: 5.0, OutputPrice: 20.0, IsFree: false, SupportsTools: true, Description: "Latest flagship model"},
+			{ID: "gpt-5.2-codex", Name: "GPT-5.2 Codex", Provider: "openai", ContextWindow: 200000, InputPrice: 3.0, OutputPrice: 12.0, IsFree: false, SupportsTools: true, Description: "Optimized for coding"},
+			{ID: "gpt-5.2-hight", Name: "GPT-5.2 Hight", Provider: "openai", ContextWindow: 200000, InputPrice: 10.0, OutputPrice: 40.0, IsFree: false, SupportsTools: true, Description: "High performance reasoning"},
 		},
 	},
 	"xai": {
@@ -90,7 +90,9 @@ var Registry = map[string]ProviderInfo{
 		ID:   "zhipu",
 		Name: "Zhipu AI (GLM)",
 		Models: []ModelInfo{
-			{ID: "glm-4-plus", Name: "GLM-4 Plus", Provider: "zhipu", ContextWindow: 128000, InputPrice: 5.0, OutputPrice: 10.0, IsFree: false, SupportsTools: true, Description: "Latest flagship"},
+			{ID: "glm-4.7", Name: "GLM-4.7", Provider: "zhipu", ContextWindow: 128000, InputPrice: 5.0, OutputPrice: 10.0, IsFree: false, SupportsTools: true, Description: "Latest flagship model"},
+			{ID: "glm-4.7-flash", Name: "GLM-4.7 Flash", Provider: "zhipu", ContextWindow: 128000, InputPrice: 0.1, OutputPrice: 0.1, IsFree: false, SupportsTools: true, Description: "High speed, low cost"},
+			{ID: "glm-4.6", Name: "GLM-4.6", Provider: "zhipu", ContextWindow: 128000, InputPrice: 5.0, OutputPrice: 10.0, IsFree: false, SupportsTools: true, Description: "Previous generation flagship"},
 			{ID: "glm-4-flash", Name: "GLM-4 Flash", Provider: "zhipu", ContextWindow: 128000, InputPrice: 0.01, OutputPrice: 0.01, IsFree: true, SupportsTools: true, Description: "Extremely fast & cheap"},
 			{ID: "glm-4-air", Name: "GLM-4 Air", Provider: "zhipu", ContextWindow: 128000, InputPrice: 0.10, OutputPrice: 0.10, IsFree: false, SupportsTools: true, Description: "Balanced performance"},
 		},

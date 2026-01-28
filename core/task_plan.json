@@ -1,0 +1,20 @@
+[
+  {
+    "id": "1",
+    "title": "Project Reconnaissance",
+    "status": "done",
+    "context": "Scan root directory and identify project type (Go/JS/Python)"
+  },
+  {
+    "id": "2",
+    "title": "Architecture Scan",
+    "status": "done",
+    "context": "Analyze internal/ and cmd/ directories for core logic"
+  },
+  {
+    "id": "3",
+    "title": "Configuration Check",
+    "status": "done",
+    "context": "Read go.mod, config.yaml, or .env files"
+  }
+]

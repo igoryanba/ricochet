@@ -1,6 +1,8 @@
 package tui
 
 import (
+	"strings"
+
 	"github.com/igoryan-dao/ricochet/internal/protocol"
 )
 
@@ -101,13 +103,21 @@ func (m *Model) updateBlockTaskTree(msg protocol.TaskProgress) {
 	// Create root if not found
 	if root == nil {
 		root = &TaskNode{
-			ID:       msg.TaskName,
-			Name:     msg.TaskName,
-			Status:   "running",
-			Expanded: true,
-			Depth:    0,
+			ID:         msg.TaskName,
+			Name:       msg.TaskName,
+			Status:     "running",
+			Expanded:   true,
+			Depth:      0,
+			AgentName:  msg.AgentIdentifier,
+			AgentColor: msg.AgentColor,
 		}
 		block.TaskTree = append(block.TaskTree, root)
+	}
+
+	// Update mutable fields
+	if msg.AgentIdentifier != "" {
+		root.AgentName = msg.AgentIdentifier
+		root.AgentColor = msg.AgentColor
 	}
 
 	// Update root status from TaskProgress.Status
@@ -115,30 +125,44 @@ func (m *Model) updateBlockTaskTree(msg protocol.TaskProgress) {
 		root.Status = msg.Status
 	}
 
-	// Add new steps as children (deduplicated)
-	for _, step := range msg.Steps {
-		found := false
-		for _, child := range root.Children {
-			if child.Name == step {
-				found = true
-				break
+	// Deduplication: Only add NEW steps
+	// Use sanitized key to prevent whitespace mismatches
+	cleanTaskName := strings.TrimSpace(msg.TaskName)
+	renderedCount := m.RenderedSteps[cleanTaskName]
+
+	if len(msg.Steps) > renderedCount {
+		newSteps := msg.Steps[renderedCount:]
+		for _, step := range newSteps {
+			// Double check if step is already a child (paranoia check for duplicates)
+			exists := false
+			for _, child := range root.Children {
+				if child.Name == step {
+					exists = true
+					break
+				}
+			}
+			if !exists {
+				root.Children = append(root.Children, &TaskNode{
+					ID:     step,
+					Name:   step,
+					Status: "done",
+					Depth:  1,
+				})
 			}
 		}
-		if !found {
-			root.Children = append(root.Children, &TaskNode{
-				ID:     step,
-				Name:   step,
-				Status: "done",
-				Depth:  1,
-			})
-		}
+		// Update count to match the inbound steps length
+		m.RenderedSteps[cleanTaskName] = len(msg.Steps)
 	}
 }
 
 // finishActiveBlocks marks all active blocks as inactive (frozen)
 func (m *Model) finishActiveBlocks() {
 	for _, block := range m.Blocks {
-		block.IsActive = false
+		if block.IsActive {
+			block.IsActive = false
+			// Optional: Collapse finished trees?
+			// for _, node := range block.TaskTree { node.Expanded = false }
+		}
 	}
 }
 

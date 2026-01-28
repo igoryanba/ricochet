@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+
+	"github.com/igoryan-dao/ricochet/internal/safeguard"
 )
 
 // Pattern to detect sed/awk commands that modify files
@@ -33,7 +35,15 @@ func (e *NativeExecutor) ExecuteCommand(ctx context.Context, args json.RawMessag
 		actionDesc += " (in background)"
 	}
 
-	if !IsSafeCommand(payload.Command) {
+	// 1. Granular Permission Check (Phase 13)
+	if e.safeguard != nil && e.safeguard.Permissions != nil {
+		// We use CheckCommand from manager
+		if err := e.safeguard.CheckCommand(strings.Split(payload.Command, " ")[0]); err != nil {
+			return "", fmt.Errorf("safeguard: %w", err)
+		}
+	}
+
+	if !safeguard.IsSafeCommand(payload.Command) {
 		if err := e.ensureConsent(ctx, "execute_command", payload.Command, actionDesc); err != nil {
 			return "", err
 		}

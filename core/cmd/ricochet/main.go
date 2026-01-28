@@ -203,6 +203,8 @@ func main() {
 		TelegramToken:  settings.LiveMode.TelegramToken,
 		TelegramChatID: settings.LiveMode.TelegramChatID,
 		AllowedUserIDs: []int64{},
+		WhisperBinary:  settings.LiveMode.WhisperBinary,
+		WhisperModel:   settings.LiveMode.WhisperModel,
 	}
 
 	// Check for flags
@@ -600,12 +602,19 @@ func runInteractiveMode(_ context.Context, cwd string) {
 		os.Exit(1)
 	}
 
+	// WIRE SWARM EVENTS TO TUI
+	controller.SetOnTaskProgress(func(progress protocol.TaskProgress) {
+		msgChan <- progress
+	})
+
 	// Initialize Live Mode if configured
 	var liveCtrl *livemode.Controller
 	if settings.LiveMode.TelegramToken != "" {
 		liveConfig := &livemode.Config{
 			TelegramToken:  settings.LiveMode.TelegramToken,
 			TelegramChatID: settings.LiveMode.TelegramChatID,
+			WhisperBinary:  settings.LiveMode.WhisperBinary,
+			WhisperModel:   settings.LiveMode.WhisperModel,
 		}
 
 		// Re-use err
@@ -647,6 +656,11 @@ func runInteractiveMode(_ context.Context, cwd string) {
 	// The Model struct has LiveCtrl field.
 
 	m := tui.NewModel(cwd, cfg.Provider.Model, msgChan, controller)
+
+	// BIND PLAN TO SESSION
+	// Now that TUI has created a fresh session ID, we tell the Controller (and PlanManager) to scope to it.
+	controller.SetMainSessionID(m.SessionID)
+
 	m.LiveCtrl = liveCtrl
 	if liveCtrl != nil {
 		m.IsEtherMode = true

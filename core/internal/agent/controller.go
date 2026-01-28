@@ -17,9 +17,11 @@ import (
 	"github.com/igoryan-dao/ricochet/internal/config"
 	context_manager "github.com/igoryan-dao/ricochet/internal/context"
 	"github.com/igoryan-dao/ricochet/internal/context/handoff"
+	"github.com/igoryan-dao/ricochet/internal/git"
 	"github.com/igoryan-dao/ricochet/internal/host"
 	"github.com/igoryan-dao/ricochet/internal/index"
 	mcpHubPkg "github.com/igoryan-dao/ricochet/internal/mcp"
+	"github.com/igoryan-dao/ricochet/internal/memory"
 	"github.com/igoryan-dao/ricochet/internal/modes"
 	"github.com/igoryan-dao/ricochet/internal/prompts"
 	"github.com/igoryan-dao/ricochet/internal/protocol"
@@ -27,6 +29,7 @@ import (
 	"github.com/igoryan-dao/ricochet/internal/rules"
 	"github.com/igoryan-dao/ricochet/internal/safeguard"
 	"github.com/igoryan-dao/ricochet/internal/skills"
+	"github.com/igoryan-dao/ricochet/internal/terminal"
 	"github.com/igoryan-dao/ricochet/internal/tools"
 	"github.com/igoryan-dao/ricochet/internal/workflow"
 )
@@ -54,14 +57,23 @@ type Controller struct {
 	skills             *skills.Manager
 	qcManager          *qc.Manager
 	dynamicHooks       *hooks.DynamicHookManager
-	memoryManager      *MemoryManager
+	memoryManager      *memory.Manager
 	injectionProcessor *InjectionProcessor
-	loopDetector       *LoopDetector // Detects repetitive content patterns
-	planManager        *PlanManager  // Manages long-term plan
+	mcpManager         *mcpHubPkg.Manager
+	gitManager         *git.Manager       // Git integration
+	contextManager     *ContextManager    // Context compaction
+	loopDetector       *LoopDetector      // Detects repetitive content patterns
+	planManager        *PlanManager       // Manages long-term plan
+	swarm              *SwarmOrchestrator // Swarm Orchestrator
+	helpAgent          *HelpAgent         // Handles help queries
+	defaultModel       string             // Default model for internal tasks
 
 	// Abort support
 	abortMu     sync.Mutex
 	abortCancel context.CancelFunc
+
+	// UI Callbacks
+	onTaskProgress func(protocol.TaskProgress)
 }
 
 // Config holds agent configuration
@@ -73,6 +85,8 @@ type Config struct {
 	ContextWindow     int                          `json:"context_window"` // Context window limit for pruning
 	EnableCodeIndex   bool                         `json:"enable_code_index"`
 	AutoApproval      *config.AutoApprovalSettings `json:"auto_approval"`
+	Tools             config.ToolsSettings         `json:"tools"`
+	Swarm             SwarmConfig                  `json:"swarm"`
 }
 
 // Session represents a chat session
@@ -142,14 +156,25 @@ func NewController(cfg *Config, opts ...ControllerOptions) (*Controller, error) 
 	safeguardMgr, err := safeguard.NewManager(cwd)
 	if err != nil {
 		log.Printf("Warning: Failed to initialize safeguard manager: %v", err)
-	} else if cfg.AutoApproval != nil {
-		safeguardMgr.SetAutoApproval(cfg.AutoApproval)
+	} else {
+		if cfg.AutoApproval != nil {
+			safeguardMgr.SetAutoApproval(cfg.AutoApproval)
+		}
+		// Set Tools Settings (DisableLLMCorrection)
+		safeguardMgr.SetToolsSettings(&cfg.Tools)
 	}
 
 	// Initialize Session Manager
 	// Store sessions in .ricochet/sessions
-	sessionDir := filepath.Join(os.Getenv("HOME"), ".ricochet", "sessions")
+	configDir := filepath.Join(os.Getenv("HOME"), ".ricochet")
+	sessionDir := filepath.Join(configDir, "sessions")
 	sessionManager := NewSessionManager(sessionDir)
+
+	// Initialize MCP Manager
+	mcpManager := mcpHubPkg.NewManager(configDir)
+
+	// Initialize Git Manager
+	gitMgr := git.NewManager(cwd)
 
 	// Initialize Embedder
 	// If EmbeddingProvider is configured, use it. Otherwise try to use main provider.
@@ -187,7 +212,7 @@ func NewController(cfg *Config, opts ...ControllerOptions) (*Controller, error) 
 	hooksMgr := hooks.NewDynamicHookManager(cwd)
 
 	// Initialize Memory Manager (Phase 15)
-	memoryMgr := NewMemoryManager(cwd)
+	memoryMgr, _ := memory.NewManager(cwd)
 
 	// Initialize Injection Processor (Phase 17)
 	injectionProc := NewInjectionProcessor(cwd)
@@ -199,6 +224,20 @@ func NewController(cfg *Config, opts ...ControllerOptions) (*Controller, error) 
 	}
 
 	executor := tools.NewNativeExecutor(h, mm, safeguardMgr, mcpHub, indexer, cg, wm)
+
+	// Register Subtask Tool (circular dependency handled via interface or setter later)
+	// For now, we'll inject it into the executor if supported, or handle via special tool dispatch.
+	// Ideally, NativeExecutor should accept custom tools.
+	// Let's add it to the NativeExecutor manually or via a wrapper.
+	// Since NativeExecutor is in `internal/tools`, we might need to extend it.
+	// For simplicity in this phase, let's assume `executor` can register dynamic tools or we handle it in `Chat` loop.
+	// BUT, the cleanest way is for NativeExecutor to know about it.
+	// Actually, `RunSubtask` is on Controller. `SubtaskTool` calls `Executor.RunSubtask`.
+	// So Controller *is* the Executor.
+
+	// Better approach: Controller creates the SubtaskTool and passes it to NativeExecutor's registry.
+	subtaskTool := &tools.SubtaskTool{} // Executor set later to avoid circular init
+	executor.RegisterTool(subtaskTool)
 
 	// Trigger indexing in background
 	if cfg.EnableCodeIndex {
@@ -253,8 +292,13 @@ func NewController(cfg *Config, opts ...ControllerOptions) (*Controller, error) 
 		dynamicHooks:       hooksMgr,
 		memoryManager:      memoryMgr,
 		injectionProcessor: injectionProc,
+		mcpManager:         mcpManager,
+		gitManager:         gitMgr,
+		contextManager:     NewContextManager(provider, cfg.ContextWindow, 4000),
 		checkpointManager:  checkpointMgr,
 		planManager:        pmMgr,
+		helpAgent:          NewHelpAgent(),
+		defaultModel:       cfg.Provider.Model,
 		loopDetector:       NewLoopDetector(3), // Detect loops after 3 repetitions
 		handoffService: handoff.NewService(func(ctx context.Context, prompt string) (string, error) {
 			req := &ChatRequest{
@@ -271,16 +315,237 @@ func NewController(cfg *Config, opts ...ControllerOptions) (*Controller, error) 
 		workflows: wm,
 	}
 
+	// Initialize Swarm Orchestrator
+	// Initialize Swarm Orchestrator
+	c.swarm = NewSwarmOrchestrator(c, pmMgr, c.config.Swarm)
+
+	// Register Swarm Tools (Now that swarm is init)
+	executor.RegisterTool(&StartSwarmToolImpl{Orchestrator: c.swarm})
+	executor.RegisterTool(&UpdatePlanToolImpl{Plan: pmMgr})
+
 	// Initialize Workflow Engine with Controller as executor
 	// Initialize Workflow Engine with Controller as executor
 	// We pass a simple adapter for command execution
 	c.workflowEngine = workflow.NewEngine(c, &CommandExecutorAdapter{Host: h})
 
+	// Close the loop: Set Controller as the SubtaskExecutor
+	subtaskTool.Executor = c
+
 	return c, nil
+}
+
+// RunSubtask executes a goal in an isolated session
+func (c *Controller) RunSubtask(ctx context.Context, parentSessionID string, goal string, contextInfo string, role string) (string, error) {
+	log.Printf("[Controller] Starting SUBTASK: %s (Role: %s, Parent: %s)", goal, role, parentSessionID)
+
+	// 1. Create Child Session
+	childSession := c.CreateSession() // Start fresh
+
+	// 1.5 Context Inheritance: Copy Active Files from Parent
+	if parentSessionID != "" {
+		parentSession := c.sessionManager.GetSession(parentSessionID)
+		if parentSession != nil {
+			activeFiles := parentSession.FileTracker.GetFiles()
+			if len(activeFiles) > 0 {
+				log.Printf("Inheriting %d active files from parent session %s", len(activeFiles), parentSessionID)
+				for _, f := range activeFiles {
+					childSession.FileTracker.AddFile(f)
+				}
+			}
+		}
+	}
+
+	// 2. Prime the session with specialized role
+	var sysPrompt string
+	switch role {
+	case "architect":
+		sysPrompt = fmt.Sprintf("You are a specialized System Architect Agent.\nGOAL: %s\nCONTEXT: %s\n\nROLE: Focus on high-level design patterns, system scalability, and trade-offs. Do not get bogged down in implementation details unless necessary. Provide a concrete plan or design document.", goal, contextInfo)
+	case "qa":
+		sysPrompt = fmt.Sprintf("You are a specialized QA/Security Agent.\nGOAL: %s\nCONTEXT: %s\n\nROLE: Critically analyze the code/plan for bugs, security vulnerabilities, and edge cases. Be pedantic but constructive. Propose tests.", goal, contextInfo)
+	case "researcher":
+		sysPrompt = fmt.Sprintf("You are a specialized Research Agent.\nGOAL: %s\nCONTEXT: %s\n\nROLE: Gather information, summarize findings, and provide citations/file paths. Do not modify code unless asked.", goal, contextInfo)
+	default: // "general"
+		sysPrompt = fmt.Sprintf("You are a Sub-Agent focused on a specific task.\nGOAL: %s\nCONTEXT: %s\n\nPerform the task efficiently. When done, output a summary of your actions.", goal, contextInfo)
+	}
+
+	childSession.StateHandler.AddMessage(protocol.Message{Role: "system", Content: sysPrompt})
+
+	// 3. Run Auto-Pilot Loop
+	// We check for "TASK_COMPLETE" in the output to break the loop.
+	// If the agent pauses (returns text without completion), we urge it to continue.
+	var finalSummary string
+	maxTurns := 15
+
+	for i := 0; i < maxTurns; i++ {
+		input := ChatRequestInput{
+			SessionID: childSession.ID,
+			Content:   "Please continue working on the goal. If you are finished, output 'TASK_COMPLETE:' followed by a summary.",
+			Via:       "subtask",
+		}
+
+		// First turn specific prompt
+		if i == 0 {
+			input.Content = fmt.Sprintf("STARTING SUBTASK: %s\nContext: %s\nPlease proceed.", goal, contextInfo)
+		}
+
+		var lastResponse string
+
+		// Run Chat (Blocking wait for this turn)
+		// We use a done channel to wait for Chat to return (which it does after its internal loop)
+		// Wait, Chat wraps everything in a goroutine?
+		// No, Chat function signature in Controller (line 499) returns error.
+		// It executes synchronously?
+		// Checking Chat implementation...
+		// It creates a `ctx, cancel`.
+		// It does `go func()`? No.
+		// It calls `callback` synchronously?
+		// Let's verify `Chat` is synchronous or blocking.
+		// `Chat` calls `c.provider.Chat` which is blocking.
+		// It loops `for currentTurn < maxTurns`.
+		// So `Chat` blocks until it finishes a "turn" (which might be multiple tool calls).
+		// Yes, `Chat` is blocking.
+
+		err := c.Chat(ctx, input, func(update interface{}) {
+			// Forward events to parent UI if callback exists
+			// Retrieve parent callback from context... wait, RunSubtask HAS the context.
+			// But we need to EXTRACT it from ctx first.
+			if parentCb, ok := ctx.Value("chat_callback").(func(interface{})); ok {
+				// We need to re-wrap the update to target the parent session
+				// and visually indicate it's a subtask.
+				switch u := update.(type) {
+				case ChatUpdate:
+					// Rewrite Session ID to parent so it renders in main view
+					u.SessionID = parentSessionID
+					// Prefix content
+					// Only prefix if it's content, not streaming chunks which might look weird if prefixed every time.
+					// But we are not streaming deeply here yet? "IsStreaming" logic.
+					// Let's just prefix the first chunk or all?
+					// Simpler: Just forward it. The content will speak for itself.
+					// Or append "[Subtask]" prefix.
+					if u.Message.Content != "" {
+						u.Message.Content = "nested > " + u.Message.Content
+					}
+					// Only forward assistant messages or system?
+					// Forward everything for transparency.
+					parentCb(u)
+
+					// Capture for local logic
+					if u.Message.Role == "assistant" && !u.Message.IsStreaming {
+						lastResponse = u.Message.Content
+					}
+				case protocol.TaskProgress:
+					// Forward task progress
+					// Inject Identity for TUI Badges
+					u.AgentIdentifier = strings.ToUpper(role)
+					switch role {
+					case "architect":
+						u.AgentColor = "#9D65FF" // Purple
+					case "qa":
+						u.AgentColor = "#FF9D00" // Orange
+					case "researcher":
+						u.AgentColor = "#00AFFF" // Blue
+					case "swarm-worker":
+						u.AgentColor = "#00FF99" // Green
+					default:
+						u.AgentColor = "#767676" // Gray
+					}
+					parentCb(u)
+				}
+			} else {
+				// Fallback local capture if no parent callback (shouldn't happen in real run)
+				if u, ok := update.(ChatUpdate); ok {
+					if u.Message.Role == "assistant" && !u.Message.IsStreaming {
+						lastResponse = u.Message.Content
+					}
+				}
+			}
+		})
+
+		if err != nil {
+			return "", fmt.Errorf("subtask error on turn %d: %w", i+1, err)
+		}
+
+		finalSummary = lastResponse
+
+		// Check for Completion Signal
+		if strings.Contains(lastResponse, "TASK_COMPLETE") {
+			finalSummary = strings.TrimPrefix(strings.Split(lastResponse, "TASK_COMPLETE")[1], ":") // Basic parsing
+			break
+		}
+
+		// Check for Failure Signal (Phase 14)
+		if strings.Contains(lastResponse, "TASK_FAILED") {
+			failReason := strings.TrimPrefix(strings.Split(lastResponse, "TASK_FAILED")[1], ":")
+			result := tools.SubtaskResult{
+				Status:       "failed",
+				Error:        strings.TrimSpace(failReason),
+				RecoveryHint: "Check the error message and context. You may need to retry with different search terms or paths.",
+			}
+			resJSON, _ := json.Marshal(result)
+			return string(resJSON), nil
+		}
+
+		// If no completion signal, loop continues with "Please continue..."
+		// Unless the agent explicitly says "I cannot continue" or similar?
+		// For now, we rely on the prompt instructing "TASK_COMPLETE".
+	}
+
+	// Default Success
+	result := tools.SubtaskResult{
+		Status:  "success",
+		Summary: strings.TrimSpace(finalSummary),
+	}
+	if result.Summary == "" {
+		// Fallback if loop finished without explicit signal (max turns reached)
+		result.Status = "failed"
+		result.Error = "Subtask timed out or did not report completion explicitly."
+	}
+
+	resJSON, _ := json.Marshal(result)
+	return string(resJSON), nil
 }
 
 func (c *Controller) GetHost() host.Host {
 	return c.host
+}
+
+func (c *Controller) GetMcpManager() *mcpHubPkg.Manager {
+	return c.mcpManager
+}
+
+func (c *Controller) GetGitManager() *git.Manager {
+	return c.gitManager
+}
+
+func (c *Controller) GetPlanManager() *PlanManager {
+	return c.planManager
+}
+
+// GenerateCommitMessage asks the LLM to generate a commit message based on the diff
+func (c *Controller) GenerateCommitMessage(ctx context.Context, diff string) (string, error) {
+	if diff == "" {
+		return "", fmt.Errorf("empty diff")
+	}
+
+	system := "You are a professional software engineer. Generate a concise, conventional commit message for the following git diff. Output ONLY the message, no extra text."
+	user := fmt.Sprintf("Diff:\n%s", diff)
+
+	messages := []protocol.Message{
+		{Role: "system", Content: system},
+		{Role: "user", Content: user},
+	}
+
+	req := &ChatRequest{
+		Model:    c.defaultModel,
+		Messages: messages,
+	}
+
+	resp, err := c.provider.Chat(ctx, req)
+	if err != nil {
+		return "", err
+	}
+
+	return strings.TrimSpace(resp.Content), nil
 }
 
 // CommandExecutorAdapter adapts host.Host to workflow.CommandExecutor
@@ -364,6 +629,16 @@ func (c *Controller) ClearSession(id string) {
 	c.sessionManager.CreateSession() // Recreate
 }
 
+// SetMainSessionID binds the controller and its components (PlanManager) to a specific active session.
+// This ensures that planning artifacts are scoped to the current interaction and not global.
+func (c *Controller) SetMainSessionID(sessionID string) {
+	if c.planManager != nil {
+		if err := c.planManager.SetSessionID(sessionID); err != nil {
+			log.Printf("[Controller] Failed to set plan session ID: %v", err)
+		}
+	}
+}
+
 // ChatRequest represents a request to chat
 type ChatRequestInput struct {
 	SessionID string `json:"session_id"`
@@ -436,6 +711,10 @@ type ToolCallInfo struct {
 
 // Chat sends a message and returns response via streaming
 func (c *Controller) Chat(ctx context.Context, input ChatRequestInput, callback func(update interface{})) error {
+	// Update terminal title to show agent is working
+	terminal.SetTerminalTitle(terminal.StateWorking)
+	defer terminal.SetTerminalTitle(terminal.StateReady)
+
 	// Create cancellable context for abort support
 	ctx, cancel := context.WithCancel(ctx)
 	c.abortMu.Lock()
@@ -446,6 +725,11 @@ func (c *Controller) Chat(ctx context.Context, input ChatRequestInput, callback 
 		c.abortCancel = nil
 		c.abortMu.Unlock()
 	}()
+
+	// Inject Session ID into context for tools (e.g. SubtaskTool)
+	ctx = context.WithValue(ctx, "session_id", input.SessionID)
+	// Inject Callback for subtask event forwarding
+	ctx = context.WithValue(ctx, "chat_callback", callback)
 
 	session := c.GetSession(input.SessionID)
 	if session == nil {
@@ -463,6 +747,121 @@ func (c *Controller) Chat(ctx context.Context, input ChatRequestInput, callback 
 		}
 		// SLASH COMMAND INTERCEPTION
 		if strings.HasPrefix(input.Content, "/") {
+			// 1. Model Switching: /model
+			if strings.HasPrefix(input.Content, "/model") {
+				args := strings.TrimSpace(strings.TrimPrefix(input.Content, "/model"))
+				if args == "" {
+					// List available models
+					available := c.providersManager.GetAvailableProviders()
+					var sb strings.Builder
+					sb.WriteString("### 🤖 Available Models\n\n")
+					for _, p := range available {
+						icon := "🔹"
+						if p.Available {
+							icon = "✅"
+						} else if p.HasKey {
+							icon = "🔑"
+						}
+						sb.WriteString(fmt.Sprintf("%s **%s** (%s)\n", icon, p.Name, p.ID))
+						for _, m := range p.Models {
+							current := ""
+							c.mu.RLock()
+							if p.ID == c.config.Provider.Provider && m.ID == c.config.Provider.Model {
+								current = " (current)"
+							}
+							c.mu.RUnlock()
+							sb.WriteString(fmt.Sprintf("  - `%s:%s`%s\n", p.ID, m.ID, current))
+						}
+						sb.WriteString("\n")
+					}
+					sb.WriteString("**Usage**: `/model provider:model` (e.g. `/model anthropic:claude-3-5-sonnet`)")
+
+					callback(ChatUpdate{
+						SessionID: input.SessionID,
+						Message: ChatMessage{
+							ID:        uuid.New().String(),
+							Role:      "assistant",
+							Content:   sb.String(),
+							Timestamp: time.Now().UnixMilli(),
+						},
+					})
+					return nil
+				}
+
+				// Switch model
+				parts := strings.Split(args, ":")
+				if len(parts) != 2 {
+					callback(ChatUpdate{
+						SessionID: input.SessionID,
+						Message: ChatMessage{
+							ID:        uuid.New().String(),
+							Role:      "assistant",
+							Content:   "❌ Invalid format. Use: `/model provider:model`",
+							Timestamp: time.Now().UnixMilli(),
+						},
+					})
+					return nil
+				}
+
+				providerID := parts[0]
+				modelID := parts[1]
+
+				// Validate and get key
+				apiKey := c.providersManager.GetAPIKey(providerID)
+				if apiKey == "" {
+					callback(ChatUpdate{
+						SessionID: input.SessionID,
+						Message: ChatMessage{
+							ID:        uuid.New().String(),
+							Role:      "assistant",
+							Content:   fmt.Sprintf("❌ No API key found for provider '%s'. Please configure it in settings or .env.", providerID),
+							Timestamp: time.Now().UnixMilli(),
+						},
+					})
+					return nil
+				}
+
+				// Re-initialize provider
+				newConfig := ProviderConfig{
+					Provider: providerID,
+					Model:    modelID,
+					APIKey:   apiKey,
+					BaseURL:  c.providersManager.GetBaseURL(providerID),
+				}
+
+				newProvider, err := NewProvider(newConfig)
+				if err != nil {
+					callback(ChatUpdate{
+						SessionID: input.SessionID,
+						Message: ChatMessage{
+							ID:        uuid.New().String(),
+							Role:      "assistant",
+							Content:   fmt.Sprintf("❌ Failed to initialize provider: %v", err),
+							Timestamp: time.Now().UnixMilli(),
+						},
+					})
+					return nil
+				}
+
+				// Hot-swap
+				c.mu.Lock()
+				c.provider = newProvider
+				c.config.Provider = newConfig
+				c.defaultModel = modelID
+				c.mu.Unlock()
+
+				callback(ChatUpdate{
+					SessionID: input.SessionID,
+					Message: ChatMessage{
+						ID:        uuid.New().String(),
+						Role:      "assistant",
+						Content:   fmt.Sprintf("✅ Switched to **%s** (`%s`)", newProvider.Name(), modelID),
+						Timestamp: time.Now().UnixMilli(),
+					},
+				})
+				return nil
+			}
+
 			cmdParts := strings.Split(input.Content, " ")
 			cmdName := cmdParts[0]
 
@@ -730,6 +1129,28 @@ func (c *Controller) Chat(ctx context.Context, input ChatRequestInput, callback 
 		log.Printf("[Agent] Starting context management. Limit: %d, WindowSize: %d, Msgs: %d, Provider: %s",
 			contextLimit, c.config.ContextWindow, len(currentMessages), c.config.Provider.Provider)
 
+		// PHASE 8: CONTEXT COMPACTION
+		if c.contextManager != nil && c.contextManager.ShouldCompact(currentMessages) {
+			compacted, err := c.contextManager.Compact(ctx, currentMessages, c.defaultModel)
+			if err != nil {
+				log.Printf("[Agent] Warning: Compaction failed: %v", err)
+			} else {
+				session.StateHandler.SetMessages(compacted)
+				currentMessages = compacted // Update local reference
+
+				// Notify frontend of compaction
+				callback(ChatUpdate{
+					SessionID: input.SessionID,
+					Message: ChatMessage{
+						ID:        uuid.New().String(),
+						Role:      "system",
+						Content:   "**Context Compacted**: History summarized to save tokens.",
+						Timestamp: time.Now().UnixMilli(),
+					},
+				})
+			}
+		}
+
 		// Initialize Condense Adapter
 		condenseProvider := &condenseAdapter{
 			p:     c.provider,
@@ -744,9 +1165,17 @@ func (c *Controller) Chat(ctx context.Context, input ChatRequestInput, callback 
 			ShowContextIndicator: true,
 		}
 
+		// HELP AGENT INTERCEPTION
+		// If query is about help, switch system prompt to Expert Help Agent
+		currentSystemPrompt := c.config.SystemPrompt
+		if c.helpAgent.IsHelpQuery(input.Content) {
+			currentSystemPrompt = c.helpAgent.GetSystemPrompt()
+			log.Printf("🤖 Help Agent Activated for query: %s", input.Content)
+		}
+
 		wm := context_manager.NewWindowManagerWithSettings(contextLimit, ctxSettings, condenseProvider)
 
-		contextResult, err := wm.ManageContext(ctx, currentMessages, c.config.SystemPrompt)
+		contextResult, err := wm.ManageContext(ctx, currentMessages, currentSystemPrompt)
 		if err != nil {
 			return fmt.Errorf("context management failure (Reflex Engine): %w", err)
 		}
@@ -1098,6 +1527,8 @@ func (c *Controller) Chat(ctx context.Context, input ChatRequestInput, callback 
 			}
 
 			if needsApproval {
+				// Set terminal title to show action required
+				terminal.SetTerminalTitle(terminal.StateActionRequired)
 				// Pause thinking status if we have one
 				emitTaskProgress("Waiting for approval...", nil, 0, 0, "")
 
@@ -1291,17 +1722,32 @@ func (c *Controller) Chat(ctx context.Context, input ChatRequestInput, callback 
 					} else {
 						result = fmt.Sprintf("Error parsing switch_mode args: %v", err)
 					}
+				case "start_swarm":
+					log.Printf("🐝 activating SWARM MODE")
+					c.swarm.Start(ctx)
+					result = "🐝 Swarm Mode Activated! Sub-agents are now processing runnable tasks in parallel."
+
 				case "update_plan":
 					var payload struct {
-						TaskID string `json:"task_id"`
-						Status string `json:"status"`
+						TaskID       string   `json:"task_id"`
+						Status       string   `json:"status"`
+						Dependencies []string `json:"dependencies"`
 					}
 					if err = json.Unmarshal([]byte(tc.Arguments), &payload); err == nil {
+						// Update Status
 						if upErr := c.planManager.UpdateTask(payload.TaskID, payload.Status); upErr != nil {
-							result = fmt.Sprintf("Failed to update plan: %v", upErr)
+							result = fmt.Sprintf("Failed to update plan status: %v", upErr)
 						} else {
-							result = fmt.Sprintf("Started 'update_plan' for task %s -> %s. Plan persisted.", payload.TaskID, payload.Status)
-							// Trigger a system prompt refresh roughly by context management
+							result = fmt.Sprintf("Updated task %s -> %s.", payload.TaskID, payload.Status)
+						}
+
+						// Update Dependencies if provided
+						if len(payload.Dependencies) > 0 {
+							if depErr := c.planManager.UpdateTaskDependencies(payload.TaskID, payload.Dependencies); depErr != nil {
+								result += fmt.Sprintf(" (Failed to set deps: %v)", depErr)
+							} else {
+								result += fmt.Sprintf(" Set dependencies: %v.", payload.Dependencies)
+							}
 						}
 					} else {
 						result = fmt.Sprintf("Error parsing update_plan args: %v", err)
@@ -1918,12 +2364,12 @@ func (c *Controller) Execute(ctx context.Context, prompt string) (string, error)
 
 // GetMemory returns the current persistent memory
 func (c *Controller) GetMemory() (string, error) {
-	return c.memoryManager.Load()
+	return c.memoryManager.GetSystemPromptPart(), nil
 }
 
 // AddMemory appends a new entry to persistent memory
 func (c *Controller) AddMemory(content string) error {
-	return c.memoryManager.Add(content)
+	return c.memoryManager.AddLegacy(content)
 }
 
 // ClearMemory wipes the persistent memory
@@ -1953,12 +2399,17 @@ func (c *Controller) InitProject(ctx context.Context) (string, error) {
 	}
 
 	// Save to memory
-	err = c.memoryManager.Save(summary)
+	err = c.memoryManager.SetRaw("project_summary", summary)
 	if err != nil {
 		return "", fmt.Errorf("failed to save memory: %w", err)
 	}
 
 	return summary, nil
+}
+
+// GetProvidersManager returns the providers manager
+func (c *Controller) GetProvidersManager() *config.ProvidersManager {
+	return c.providersManager
 }
 
 // --- Checkpoint Management (Phase 18) ---
@@ -2054,4 +2505,20 @@ func (c *Controller) validateToolUse(toolName string, planMode bool) error {
 // GetSafeguard returns the safeguard manager
 func (c *Controller) GetSafeguard() *safeguard.Manager {
 	return c.safeguard
+}
+
+// SetOnTaskProgress sets the callback for task progress updates
+func (c *Controller) SetOnTaskProgress(callback func(protocol.TaskProgress)) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.onTaskProgress = callback
+}
+
+// ReportTaskProgress sends a progress update to the UI
+func (c *Controller) ReportTaskProgress(ctx context.Context, progress protocol.TaskProgress) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.onTaskProgress != nil {
+		c.onTaskProgress(progress)
+	}
 }

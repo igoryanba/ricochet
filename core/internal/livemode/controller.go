@@ -12,6 +12,7 @@ import (
 	"github.com/igoryan-dao/ricochet/internal/protocol"
 	"github.com/igoryan-dao/ricochet/internal/state"
 	"github.com/igoryan-dao/ricochet/internal/telegram"
+	"github.com/igoryan-dao/ricochet/internal/whisper"
 )
 
 type contextKey string
@@ -89,6 +90,8 @@ type Config struct {
 	TelegramToken  string  `json:"telegram_token"`
 	TelegramChatID int64   `json:"telegram_chat_id"`
 	AllowedUserIDs []int64 `json:"allowed_user_ids"`
+	WhisperBinary  string  `json:"whisper_binary,omitempty"`
+	WhisperModel   string  `json:"whisper_model,omitempty"`
 }
 
 // Status represents the current Live Mode status
@@ -148,6 +151,19 @@ func New(cfg *Config, agentCtrl *agent.Controller) (*Controller, error) {
 			return nil, fmt.Errorf("failed to create telegram bot: %w", err)
 		}
 		ctrl.tgBot = tgBot
+	}
+
+	// Initialize Whisper if configured
+	if cfg.WhisperBinary != "" && cfg.WhisperModel != "" {
+		transcriber, err := whisper.NewTranscriber(cfg.WhisperBinary, cfg.WhisperModel)
+		if err != nil {
+			log.Printf("⚠️ Failed to initialize Whisper transcriber: %v", err)
+		} else {
+			if ctrl.tgBot != nil {
+				ctrl.tgBot.SetTranscriber(transcriber)
+				log.Println("🎙️ Whisper transcription enabled")
+			}
+		}
 	}
 
 	return ctrl, nil

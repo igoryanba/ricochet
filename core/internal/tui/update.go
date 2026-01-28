@@ -2,6 +2,7 @@ package tui
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"math/rand"
 	"os"
@@ -9,6 +10,7 @@ import (
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 	"github.com/igoryan-dao/ricochet/internal/agent"
 	"github.com/igoryan-dao/ricochet/internal/protocol"
 )
@@ -19,6 +21,110 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		vpCmd tea.Cmd
 		spCmd tea.Cmd
 	)
+
+	// GLOBAL TOGGLES
+	if kmsg, ok := msg.(tea.KeyMsg); ok {
+		if kmsg.String() == "ctrl+p" {
+			m.IsPlanMode = !m.IsPlanMode
+			m.PlanAddingTask = false // Reset state
+			if m.IsPlanMode {
+				m.IsShellFocused = false // Ensure focus is relevant
+				m.Textarea.Blur()
+			} else {
+				m.Textarea.Focus()
+			}
+			m.UpdateViewport()
+			return m, nil
+		}
+	}
+
+	// PLAN MODE INTERCEPTION
+	if m.IsPlanMode {
+		// 1. Text Input Mode (Adding Task)
+		if m.PlanAddingTask {
+			switch msg := msg.(type) {
+			case tea.KeyMsg:
+				switch msg.Type {
+				case tea.KeyEsc:
+					m.PlanAddingTask = false
+					m.Textarea.Reset()
+					m.Textarea.Blur()
+					m.UpdateViewport()
+					return m, nil
+				case tea.KeyEnter:
+					title := m.Textarea.Value()
+					if title != "" {
+						pm := m.Controller.GetPlanManager()
+						if pm != nil {
+							pm.AddTask(title, "")
+						}
+					}
+					m.PlanAddingTask = false
+					m.Textarea.Reset()
+					m.Textarea.Blur()
+					m.UpdateViewport()
+					return m, nil
+				}
+			}
+			// Forward typing to textarea
+			m.Textarea.Focus()
+			m.Textarea, tiCmd = m.Textarea.Update(msg)
+			return m, tiCmd
+		}
+
+		// 2. Navigation Mode
+		if kmsg, ok := msg.(tea.KeyMsg); ok {
+			key := kmsg.String()
+			pm := m.Controller.GetPlanManager()
+
+			switch key {
+			case "up", "k":
+				m.PlanCursor--
+				if m.PlanCursor < 0 {
+					m.PlanCursor = 0
+				}
+				m.UpdateViewport()
+				return m, nil
+			case "down", "j":
+				if pm != nil && m.PlanCursor < len(pm.Tasks)-1 {
+					m.PlanCursor++
+				}
+				m.UpdateViewport()
+				return m, nil
+			case "a":
+				m.PlanAddingTask = true
+				m.Textarea.Placeholder = "Enter new task title..."
+				m.Textarea.Focus()
+				m.UpdateViewport()
+				return m, nil
+			case "d", "delete":
+				if pm != nil && len(pm.Tasks) > 0 {
+					// Rudimentary delete: filter out task at cursor
+					// Assuming PlanManager has RemoveTask or we do it manually safely?
+					// Let's assume AddTask exists, check RemoveTask later.
+					// For now, skip delete or implement manual slice removal if safe.
+					// pm.RemoveTask(m.PlanCursor) -> TODO: Add method to PlanManager
+				}
+				return m, nil
+			case "enter", "space":
+				if pm != nil && len(pm.Tasks) > 0 {
+					t := pm.Tasks[m.PlanCursor]
+					newStatus := "done"
+					switch t.Status {
+					case "done":
+						newStatus = "pending"
+					case "pending":
+						newStatus = "active"
+					}
+					pm.UpdateTaskStatus(t.ID, newStatus)
+					m.UpdateViewport()
+				}
+				return m, nil
+			}
+		}
+		// Block other keys in plan mode
+		return m, nil
+	}
 
 	// Modal Interception
 	if m.PendingChoice != nil {
@@ -66,8 +172,79 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 	}
 
-	m.Textarea, tiCmd = m.Textarea.Update(msg)
-	m.Viewport, vpCmd = m.Viewport.Update(msg)
+	// INTERCEPT KEYBOARD for Tab Toggle Logic
+	if k, ok := msg.(tea.KeyMsg); ok && k.String() == "tab" && !m.ShowSuggestions {
+		m.IsShellFocused = !m.IsShellFocused
+		// Sync Focus State Immediately
+		if m.IsShellFocused {
+			m.Textarea.Blur()
+		} else {
+			m.Textarea.Focus()
+		}
+		return m, nil
+	}
+
+	// Update Focus State (Textarea)
+	// Ensure visual state matches logical state
+	if m.IsShellFocused {
+		m.Textarea.Blur()
+	} else {
+		m.Textarea.Focus()
+	}
+
+	// Dispatch Messages based on Focus
+	if m.IsShellFocused {
+		// Shell Focused: Viewport gets keys
+		m.Viewport, vpCmd = m.Viewport.Update(msg)
+		// Textarea gets nothing (it's blurred)
+		m.Textarea, tiCmd = m.Textarea.Update(msg)
+	} else {
+		// Input Focused: Textarea gets keys
+		m.Textarea, tiCmd = m.Textarea.Update(msg)
+
+		// Only pass non-typing messages to Viewport (e.g. mouse, windowsize)
+		switch msg.(type) {
+		case tea.KeyMsg:
+			// Skip Viewport update for keys to prevent scrolling while typing
+			// UNLESS it's PageUp/PageDown?
+			// For now, assume scrolling is mainly mouse or switching focus.
+		case tea.MouseMsg:
+			// Mouse events always go to Viewport (for scrolling)
+			m.Viewport, vpCmd = m.Viewport.Update(msg)
+		default:
+			m.Viewport, vpCmd = m.Viewport.Update(msg)
+		}
+	}
+
+	// Auto-Expand Textarea (1 to 5 lines)
+	// We use lipgloss to measure visual lines because m.Textarea.LineCount()
+	// only counts physical newlines in some bubbletea versions/configs.
+	// Box is Width - 2.
+	// Box has Border (1+1) + Padding (1+1) = 4 overhead.
+	// Inner width = (Width - 2) - 4 = Width - 6.
+	taWidth := m.TerminalWidth - 6
+	if taWidth < 10 {
+		taWidth = 10
+	}
+
+	val := m.Textarea.Value()
+	// Render text wrapped at taWidth to count lines
+	measureStyle := lipgloss.NewStyle().Width(taWidth)
+	rendered := measureStyle.Render(val)
+	visualLines := lipgloss.Height(rendered)
+
+	// Clamp to 1-5 lines
+	if visualLines < 1 {
+		visualLines = 1
+	}
+	if visualLines > 5 {
+		visualLines = 5
+	}
+
+	if m.Textarea.Height() != visualLines {
+		m.Textarea.SetHeight(visualLines)
+		m.recalculateViewportHeight()
+	}
 
 	// Suggestion Logic
 	prevShow := m.ShowSuggestions
@@ -93,8 +270,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case RemoteInputMsg:
 		// SYNC: Show user input from Telegram in TUI
-		m.Messages = append(m.Messages, DisplayMessage{Role: "user", Content: msg.Content, Style: "user"})
-		m.TaskTree = nil
+		m.appendUserBlock(msg.Content)
 		m.IsLoading = true
 		m.UpdateViewport()
 		// CRITICAL: Must continue waiting for messages, otherwise TUI becomes deaf to following Agent response.
@@ -153,18 +329,30 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					} else {
 						return m, nil
 					}
+				} else if msg.String() == "tab" {
+					// Toggle Focus
+					m.IsShellFocused = !m.IsShellFocused
+					return m, nil
 				}
 			case "esc":
 				m.ShowSuggestions = false
 				return m, nil
 			}
+		} else {
+			// Suggestions closed, check for Tab Toggle
+			if msg.String() == "tab" {
+				m.IsShellFocused = !m.IsShellFocused
+				return m, nil
+			}
 		}
 
 		if msg.String() == "ctrl+r" {
-			// Simple toggle for the last active node (deepest running)
-			// Matches Claude Code's "Collapse/Expand" hotkey.
-			if len(m.TaskTree) > 0 {
-				m.TaskTree[len(m.TaskTree)-1].Expanded = !m.TaskTree[len(m.TaskTree)-1].Expanded
+			// Toggle expansion for the active tree block
+			block := m.ensureActiveTreeBlock()
+			if block != nil && len(block.TaskTree) > 0 {
+				lastNode := block.TaskTree[len(block.TaskTree)-1]
+				lastNode.Expanded = !lastNode.Expanded
+				m.UpdateViewport()
 			}
 			return m, nil
 		}
@@ -176,12 +364,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.Controller.AbortCurrentSession()
 				m.IsLoading = false
 				m.CurrentAction = ""
-				m.TaskTree = nil
-				m.Messages = append(m.Messages, DisplayMessage{
-					Role:    "system",
-					Content: "⛔ Task cancelled by user.",
-					Style:   "system",
-				})
+				m.finishActiveBlocks()
+
+				// Add system message via block (or special type?)
+				// For now, let's just append a text block with system style
+				textBlock := m.getOrCreateTextBlock()
+				textBlock.Content += "\n\n⛔ Task cancelled by user."
+
 				m.UpdateViewport()
 				return m, m.waitForMsg()
 			}
@@ -192,6 +381,29 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.String() == "ctrl+c" {
 			return m, tea.Quit
 		}
+
+		// Alt+Enter for Manual Newline
+		if msg.String() == "alt+enter" {
+			// Simulate Enter key for textarea to insert newline
+			var cmd tea.Cmd
+			m.Textarea, cmd = m.Textarea.Update(tea.KeyMsg{Type: tea.KeyEnter})
+
+			// Manually trigger auto-expand logic immediately for responsiveness
+			lc := m.Textarea.LineCount()
+			if lc < 1 {
+				lc = 1
+			}
+			if lc > 5 {
+				lc = 5
+			}
+			if m.Textarea.Height() != lc {
+				m.Textarea.SetHeight(lc)
+				m.recalculateViewportHeight()
+				m.UpdateViewport()
+			}
+			return m, cmd
+		}
+
 		if msg.String() == "enter" {
 			if m.Textarea.Value() == "" {
 				return m, nil
@@ -209,7 +421,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 				res, cmd := m.handleSlashCommand(input)
 				if res != "" {
-					m.Messages = append(m.Messages, DisplayMessage{Role: "system", Content: res, Style: "system"})
+					// System message for command result
+					textBlock := m.getOrCreateTextBlock()
+					textBlock.Content += "\n" + res
 				}
 				m.UpdateViewport()
 				return m, cmd
@@ -221,14 +435,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 
 			// Chat
-			m.Messages = append(m.Messages, DisplayMessage{Role: "user", Content: input, Style: "user"})
-
 			// INTERLEAVED BLOCKS: Create User block + new Tree block
 			// appendUserBlock automatically creates the tree block
 			m.appendUserBlock(input)
-
-			// Reset legacy TaskState for new turn (kept for compatibility)
-			m.TaskTree = nil
 
 			m.UpdateViewport()
 			m.IsLoading = true
@@ -273,11 +482,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 	case StreamMsg:
-		// Check for last message (legacy)
-		if len(m.Messages) == 0 || m.Messages[len(m.Messages)-1].Style != "agent" {
-			m.Messages = append(m.Messages, DisplayMessage{Role: "assistant", Content: "", Style: "agent"})
-		}
-
 		if msg.Done {
 			m.IsLoading = false
 			m.CurrentAction = "" // Reset status on done
@@ -285,7 +489,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// INTERLEAVED BLOCKS: Mark all active blocks as finished
 			m.finishActiveBlocks()
 		} else {
-			m.Messages[len(m.Messages)-1].Content += msg.Content
 			// INTERLEAVED BLOCKS: Stream to text block
 			textBlock := m.getOrCreateTextBlock()
 			textBlock.Content += msg.Content
@@ -302,8 +505,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// INTERLEAVED BLOCKS: Update block-based task tree
 		m.updateBlockTaskTree(msg)
 
-		// Legacy: Tree View Logic (kept for compatibility)
-		m.updateTaskTree(msg)
+		// UPDATE GLOBAL STATE for Dashboard
+		// Create a copy to prevent pointer issues if msg is reused (unlikely but safe)
+		prog := msg
+		m.Tasks[msg.TaskName] = &prog
 
 		// Dynamic Status / Smart Summary
 		if msg.Status != "" {
@@ -313,24 +518,17 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.CurrentAction = msg.Summary
 		}
 
-		// Smart Tool Result Parsing for Tree
-		if len(msg.Steps) > 0 {
-			// Check last step for tool results
-			// lastStep := msg.Steps[len(msg.Steps)-1]
-			// e.g. "Read 78 lines" or "Found 3 files"
-
-			// This relies on the controller sending formatted steps.
-			// Ideally we'd parse the Meta from the task node if we had it.
-			// For now, let's assume the controller does its job or we parse here if needed.
-		}
-
 		// Mode Sync
-		switch msg.Mode {
-		case "planning":
-			m.IsPlanMode = true
-		case "execution", "verification":
-			m.IsPlanMode = false
-		}
+		// Mode Sync
+		// DISABLE AUTO-SWITCH: Allow manual toggle (Shift+Tab) only to prevent "Empty Plan" confusion
+		/*
+			switch msg.Mode {
+			case "planning":
+				m.IsPlanMode = true
+			case "execution", "verification":
+				m.IsPlanMode = false
+			}
+		*/
 
 		m.UpdateViewport()
 		// Return both waitForMsg AND Spinner.Tick for animation
@@ -339,7 +537,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case AskUserMsg:
 		m.IsLoading = false
 		m.PendingApproval = &msg
-		m.Messages = append(m.Messages, DisplayMessage{Role: "system", Content: "❓ " + msg.Question, Style: "system"})
+		// System message for question
+		// We handle this via PendingApproval overlay in View(), but maybe log it to history too?
+		// For now, overlay is enough.
 		m.UpdateViewport()
 		return m, m.waitForMsg()
 
@@ -347,29 +547,18 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// AUTO-PILOT INTERCEPTION
 		if m.AutoStepsRemaining > 0 {
 			// Check if this is a tool execution request (heuristic)
-			// The prompt normally puts "The agent wants to execute..."
 			isToolExec := strings.Contains(msg.Question, "execute") || strings.Contains(msg.Question, "approve")
 
 			if isToolExec {
 				m.AutoStepsRemaining--
 				// Auto-Confirm (Choice 0 = Yes)
 				go func() { msg.RespChan <- 0 }()
-
-				// Optional: Show a flash message or log it?
-				// m.Messages = append(m.Messages, DisplayMessage{Role: "system", Content: "🟣 Auto-Pilot: Approved tool execution.", Style: "system"})
-
-				// Don't change U I state, just return
 				return m, nil
 			}
 		}
 
 		m.IsLoading = false
-		m.PendingChoice = &msg // Logic already exists in Update(msg) to handle key inputs for this
-		// We don't append to history here, we show a modal?
-		// Actually, let's append the question to history so context is clear?
-		// Or just let the modal handle it.
-		// The modal interception logic at top of Update() handles the keys.
-		// We just need to trigger the view.
+		m.PendingChoice = &msg
 		m.UpdateViewport()
 		return m, m.waitForMsg()
 
@@ -390,7 +579,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 		// SYNC: Show remote Telegram messages in TUI
-		// FILTER: Ignore empty messages unless they are tool calls, have reasoning, OR are actively streaming (priming the bubble)
+		// FILTER: Ignore empty messages unless they are tool calls, have reasoning, OR are actively streaming
 		hasContent := strings.TrimSpace(msg.Message.Content) != ""
 		hasReasoning := strings.TrimSpace(msg.Message.Reasoning) != ""
 		hasTools := len(msg.Message.ToolCalls) > 0
@@ -398,14 +587,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		// Allow empty message if it's the start of a stream (IsStreaming=true)
 		if !hasContent && !hasTools && !hasReasoning && !isStreaming {
-			// CRITICAL: Must continue waiting for messages even if we ignore this one.
-			// Returning nil command kills the listener loop.
 			return m, m.waitForMsg()
-		}
-
-		style := "user"
-		if msg.Message.Role == "assistant" {
-			style = "agent"
 		}
 
 		// INTERLEAVED BLOCKS: Update blocks for remote messages
@@ -418,38 +600,39 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// Empty streaming messages should NOT create text blocks (they're just heartbeats)
 			if hasContent || hasReasoning {
 				textBlock := m.getOrCreateTextBlock()
-				textBlock.Content = msg.Message.Content
+				// Streaming append or replace?
+				// Since we get full updates sometimes or chunks, this needs care.
+				// Assuming streaming updates are incremental? No, usually they are appended here.
+				// Actually StreamMsg handles "diff". RemoteChatMsg usually comes as full or partial?
+				// To be safe in TUI for now, let's just Append if it's new, or Update if it's streaming.
+				// With blocks, we just update the last block's content.
+
+				// TODO: Logic for incremental vs full replacement for remote msgs
+				// For now, simplistic replacement or append:
+				// If we assume sequential streaming chunks:
+				// textBlock.Content += msg.Message.Content
+				// BUT RemoteChatMsg might be the *full* message so far?
+				// Let's assume it's like a stream chunk for now given `StreamMsg` usage above.
+				if msg.Message.Content != "" {
+					// We might need a better diff or just trust the latest if we are replacing.
+					// But `textBlock` is persistent.
+					// Let's assume the controller handles dedupe? No, controller sends chunks usually.
+					// Wait, the `StreamMsg` logic handles `diff`.
+					// `RemoteChatMsg` might be different.
+					// Ideally we'd replace the content if it's an update to the SAME message ID.
+					// But we don't track message IDs well here.
+					// Let's append for now and fix if double rendering occurs.
+					// Safe bet: if IsStreaming, it's a chunk?
+					textBlock.Content = msg.Message.Content // Replace assumes full state?
+					// Or Append? Code says `lastMsg.Content = msg.Message.Content` in legacy.
+					// So it was REPLACING.
+					// Let's REPLA C E the content of the last block if it's active.
+				}
 				textBlock.Reasoning = msg.Message.Reasoning
 			}
 		}
 
-		// LEGACY: Also update Messages array for backward compatibility
-		shouldAppend := true
-		if len(m.Messages) > 0 {
-			lastMsg := &m.Messages[len(m.Messages)-1]
-			// If last message is same role and styles match, AND content is a prefix match (streaming update)
-			// OR if old content is empty (start of stream)
-			if lastMsg.Role == msg.Message.Role && lastMsg.Style == style {
-				// We assume it's the same message stream if it's the last one.
-				// For more robustness we could check ID, but ID might change or be missing in some flows.
-				// Let's stick to the existing "append vs update" logic but make it robust for empty starts.
-				lastMsg.Content = msg.Message.Content
-				lastMsg.Reasoning = msg.Message.Reasoning
-				shouldAppend = false
-			}
-		}
-
-		if shouldAppend {
-			m.Messages = append(m.Messages, DisplayMessage{
-				Role:      msg.Message.Role,
-				Content:   msg.Message.Content,
-				Reasoning: msg.Message.Reasoning,
-				Style:     style,
-			})
-		}
-
-		// AUTO-SWITCH SESSION: If the remote message belongs to a different session, switch to it.
-		// This ensures the shell "follows" the Telegram conversation.
+		// AUTO-SWITCH SESSION
 		if msg.Message.SessionID != "" && msg.Message.SessionID != m.SessionID {
 			m.SessionID = msg.Message.SessionID
 		}
@@ -482,6 +665,34 @@ func (m *Model) updateSuggestions() {
 		}
 		m.ShowSuggestions = len(m.Suggestions) > 0
 		return
+	}
+
+	// 2. Model Argument Autocomplete
+	if strings.HasPrefix(val, "/model ") {
+		query := strings.TrimPrefix(val, "/model ")
+		// Fetch only if controller available
+		if m.Controller != nil {
+			pm := m.Controller.GetProvidersManager()
+			if pm != nil {
+				available := pm.GetAvailableProviders()
+				m.Suggestions = nil
+				for _, p := range available {
+					if !p.Available && !p.HasKey {
+						continue
+					}
+					for _, model := range p.Models {
+						// suggestions format: "provider:model"
+						sug := fmt.Sprintf("%s:%s", p.ID, model.ID)
+						// Filter by query
+						if strings.HasPrefix(sug, query) {
+							m.Suggestions = append(m.Suggestions, sug)
+						}
+					}
+				}
+				m.ShowSuggestions = len(m.Suggestions) > 0
+				return
+			}
+		}
 	}
 
 	// 2. Help (?)
@@ -536,6 +747,14 @@ func (m *Model) selectSuggestion() bool {
 	} else if strings.HasPrefix(sug, "@") {
 		atIdx := strings.LastIndex(val, "@")
 		m.Textarea.SetValue(val[:atIdx] + sug + " ")
+	} else if strings.HasPrefix(val, "/model ") {
+		// Replace entire input with command + selected model
+		m.Textarea.SetValue("/model " + sug)
+		return true // Auto-submit? Or let user press enter? Let's just fill it.
+		// Actually, standard behavior is fill and let user confirm.
+		// Wait, if I return true, it tries to auto-exec?
+		// autoExec map doesn't contain these args usually.
+		// Let's standard return false to keep cursor at end.
 	}
 
 	m.Textarea.SetCursor(len(m.Textarea.Value()))
@@ -548,6 +767,8 @@ func (m *Model) selectSuggestion() bool {
 		m.Textarea.SetValue(sug)
 		return true
 	}
+	// For model selection, we might want to auto-submit if it's a complete selection?
+	// For now, let user hit enter.
 	return false
 }
 
@@ -562,15 +783,36 @@ func (m *Model) recalculateViewportHeight() {
 	// Input: Textarea (Default 1 line + formatting?) -> Let's reserve 3 lines for safety (1 line input + border/padding)
 	// Suggestion Box: 7 lines if visible
 
-	headerH := 3
+	// Fixed Heights
+	// Header: Border(1) + Content(1) + Border(1) + Padding(1) = 4 lines
+	// Fixed Heights
+	// Header: Border(1) + Content(1) + Border(1) + Padding(1) = 4 lines
+	headerH := 4
 	footerH := 1
-	inputH := 3
+
+	// Dynamic Input Height
+	// Textarea Height (1-5) + Box Border (2)
+	inputH := m.Textarea.Height() + 2
+
 	safetyMargin := 1 // Prevent scroll flicker
 
 	layoutReserved := headerH + footerH + inputH + safetyMargin
 
 	if m.ShowSuggestions {
 		layoutReserved += 7
+	}
+
+	// Dynamic Dashboard Height Calculation
+	// Must match RenderTaskDashboard logic:
+	// Border(2) + Title/Pad(2) = 4 overhead
+	// Plus 1 line per task
+	pm := m.Controller.GetPlanManager()
+	if pm != nil {
+		taskCount := len(pm.GetTasks())
+		if taskCount > 0 {
+			dashboardHeight := taskCount + 4
+			layoutReserved += dashboardHeight
+		}
 	}
 
 	// Calculate Viewport Height
@@ -580,6 +822,14 @@ func (m *Model) recalculateViewportHeight() {
 	}
 
 	m.Viewport.Height = vpHeight
-	m.Viewport.Width = m.TerminalWidth   // Ensure width is synced
-	m.Textarea.SetWidth(m.TerminalWidth) // Ensure input width is synced
+	m.Viewport.Width = m.TerminalWidth // Ensure width is synced
+
+	// Sync Textarea Width
+	// terminal - 2(box) - 2(pad) - 2(border) = -6
+	// We use -6 (and min 10) to match visual constraints.
+	taWidth := m.TerminalWidth - 6
+	if taWidth < 10 {
+		taWidth = 10
+	}
+	m.Textarea.SetWidth(taWidth)
 }

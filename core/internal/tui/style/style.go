@@ -75,4 +75,10 @@ var (
 			Padding(0, 1)
 
 	TitleStyle = lipgloss.NewStyle().Foreground(BorderColor.GetForeground()).Bold(true)
+
+	// -- Added for Plan Editor --
+	SubtleStyle   = lipgloss.NewStyle().Foreground(MutedGray)
+	SuccessStyle  = lipgloss.NewStyle().Foreground(Green)
+	AccentStyle   = lipgloss.NewStyle().Foreground(BurntOrange)
+	SelectedStyle = lipgloss.NewStyle().Foreground(White).Bold(true).Background(lipgloss.Color("236"))
 )

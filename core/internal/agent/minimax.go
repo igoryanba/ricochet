@@ -10,7 +10,7 @@ func NewMinimaxProvider(apiKey, model string) Provider {
 	if model == "" {
 		model = "MiniMax-M2.1" // Default model
 	}
-	return NewOpenAIProvider(apiKey, model, "https://api.minimax.io/v1")
+	return NewOpenAIProvider(apiKey, model, "https://api.minimax.io/v1", "", "")
 }
 
 // MiniMax model definitions for reference:

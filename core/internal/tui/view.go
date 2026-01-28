@@ -15,7 +15,11 @@ func (m Model) View() string {
 	}
 
 	// 1. Header
+	// 1. Header
 	header := RenderDashboard(m)
+
+	// 1.5 Mission Control (Dynamic Dashboard) - Rendered but composed later
+	missionControl := RenderTaskDashboard(m)
 
 	// 2. Viewport (Content)
 	viewport := m.Viewport.View()
@@ -26,10 +30,24 @@ func (m Model) View() string {
 	// 4. Input
 	input := m.Textarea.View()
 
+	// Wrap Input in a Box
+	input = style.BoxStyle.Width(m.TerminalWidth - 2).Render(input)
+
 	// 5. Suggestions (Optional Overlay)
 	suggestions := ""
 	if m.ShowSuggestions {
 		suggestions = m.renderSuggestions()
+	}
+
+	// Focus Styles
+	if m.IsShellFocused {
+		// Highlight Input Border when focused (if using box, border color changes)
+		// We can change BoxStyle dynamically or just rely on focus indicator.
+		// For now, let's keep it simple.
+		// Dim Input
+		input = lipgloss.NewStyle().Foreground(lipgloss.Color("240")).Render(input)
+		// Highlight Viewport Border (if we had one) - Viewport is just text usually.
+		viewport = lipgloss.NewStyle().Border(lipgloss.NormalBorder()).BorderForeground(style.BurntOrange).Render(viewport)
 	}
 
 	// COMPOSITION:
@@ -42,12 +60,24 @@ func (m Model) View() string {
 	return lipgloss.JoinVertical(lipgloss.Left,
 		header,
 		viewport,
+		missionControl, // Moved to bottom
 		bottom,
 	)
 }
 
 func (m *Model) UpdateViewport() {
 	var sb strings.Builder
+
+	// Plan Mode Override
+	if m.IsPlanMode {
+		m.Viewport.SetContent(RenderPlan(*m))
+		m.Viewport.GotoBottom() // Optional: maybe GotoTop for plan is better? Let's default Plan to Top properly or Bottom.
+		// Plans usually read from top.
+		// But Viewport handles initialization.
+		// If I switch views, I might want to reset scroll.
+		// For now, let's just set content.
+		return
+	}
 
 	// ========================
 	// INTERLEAVED BLOCKS RENDERING (Claude Code-style)
@@ -215,7 +245,12 @@ func RenderDashboard(m Model) string {
 	}
 
 	left := logo + separator + style.SystemStyle.Render(modelInfo)
-	right := style.SystemStyle.Render("Run /help")
+	hints := []string{
+		"⇧⇥ Plan",
+		"^E Ether",
+		"/help",
+	}
+	right := style.SystemStyle.Render(strings.Join(hints, " • "))
 
 	spaceCount := w - lipgloss.Width(left) - lipgloss.Width(right)
 	if spaceCount < 1 {
@@ -223,7 +258,20 @@ func RenderDashboard(m Model) string {
 	}
 	spacer := strings.Repeat(" ", spaceCount)
 
-	return style.HeaderStyle.Width(w).Render(left + spacer + right)
+	// Add top padding/margin to prevent clipping (External)
+	// We return a newline + the rendered box
+	return "\n" + style.HeaderStyle.Width(w).Render(left+spacer+right)
+}
+
+// detectToolType returns whether a tool should be rendered as "Inline" or "Block"
+func detectToolType(name string) string {
+	// Block Tools: Produce heavy output or side effects worth showing in a box
+	switch name {
+	case "view_file", "write_to_file", "replace_file_content", "run_command", "view_code_item":
+		return "block"
+	}
+	// Inline Tools: Quick status checks or lightweight ops
+	return "inline"
 }
 
 func RenderTaskTree(nodes []*TaskNode, prefix string, spin spinner.Model, isLoading bool) string {
@@ -232,80 +280,33 @@ func RenderTaskTree(nodes []*TaskNode, prefix string, spin spinner.Model, isLoad
 	for i, node := range nodes {
 		isRealLast := i == len(nodes)-1
 
-		// Determine if we need to append a synthetic "Thinking..." tail AFTER this node (as a sibling)
-		// This happens if:
-		// 1. This is the last real node
-		// 2. We are loading
-		// 3. This node is NOT running (it's done)
-		// 4. This node has NO children (it's a leaf).
-		//    (If it has children, the tail appears inside the children list via recursion)
+		// Determine if we need to append a synthetic "Thinking..." tail AFTER this node
 		wantsTail := isRealLast && isLoading && node.Status != "running" && len(node.Children) == 0
 
 		// 1. Connector
 		connector := "├─ "
 		childPrefix := "│  "
 
-		// If it's the real last node AND we don't want a tail, then it's visually last.
 		if isRealLast && !wantsTail {
 			connector = "└─ "
 			childPrefix = "   "
 		}
 
-		// 2. Icon & Style
-		icon := "○"
-		if !isRealLast && node.Depth == 0 {
-			icon = "●" // Root nodes filled
-		}
-		s := style.TreeStyle
-		textStyle := style.SystemStyle
+		// Tool Type Detection
+		toolType := detectToolType(node.Name)
 
-		switch node.Status {
-		case "running":
-			// ACTIVE SPINNER
-			icon = spin.View()
-			s = style.TreeActiveStyle   // Orange
-			textStyle = style.UserStyle // Bold/Bright
-		case "completed", "done":
-			icon = "✓"
-			s = lipgloss.NewStyle().Foreground(style.Green)
-		case "failed":
-			icon = "x"
-			s = style.ErrorStyle
+		// 2. Render Node based on Type
+		if toolType == "inline" {
+			sb.WriteString(RenderInlineTool(node, prefix, connector, spin))
+		} else {
+			sb.WriteString(RenderBlockTool(node, prefix, connector, spin))
 		}
 
-		if node.Depth == 0 {
-			textStyle = style.UserStyle.Bold(true)
-		}
-
-		// 3. Render Line
-		meta := ""
-		if node.Meta != "" {
-			meta = " " + style.MetaStyle.Render(node.Meta)
-		}
-
-		hint := ""
-		if !node.Expanded && (len(node.Children) > 0 || node.Meta != "") {
-			hint = " " + style.MetaStyle.Render("(ctrl+r to expand)")
-		}
-
-		sb.WriteString(fmt.Sprintf("%s%s%s %s%s%s\n",
-			style.SystemStyle.Render(prefix),
-			style.SystemStyle.Render(connector),
-			s.Render(icon),
-			textStyle.Render(node.Name),
-			meta,
-			hint,
-		))
-
-		// 4. TERMINAL BLOCK (Command Output)
-		if node.Result != "" {
-			// Check status to ensure we only show finished results
+		// 3. Render Block Output (Command Output / File Content)
+		// Only for Block tools usually, or if Result is present and significant.
+		// For Inline tools, we might skip detailed result unless it's an error.
+		if node.Result != "" && toolType == "block" {
 			if node.Status == "done" || node.Status == "completed" || node.Status == "failed" {
-				// Render the output block
-				// We pass `prefix + childPrefix` to indent it as a child of this node
-				// But wait, `childPrefix` depends on whether it's the last node.
-				// `RenderTaskTree` calculates `childPrefix` above.
-				// If we use `prefix + childPrefix`, it will align with children.
 				sb.WriteString(RenderTerminalOutput(node.Result, prefix+childPrefix, node.Expanded))
 			}
 		}
@@ -319,7 +320,7 @@ func RenderTaskTree(nodes []*TaskNode, prefix string, spin spinner.Model, isLoad
 			// Render the "Thinking..." tail as a SIBLING (Same prefix)
 			tailConnector := "└─ "
 			sb.WriteString(fmt.Sprintf("%s%s%s %s\n",
-				style.SystemStyle.Render(prefix), // SAME PREFIX
+				style.SystemStyle.Render(prefix),
 				style.SystemStyle.Render(tailConnector),
 				style.TreeActiveStyle.Render(spin.View()),
 				style.ThinkingStyle.Render("Thinking..."),
@@ -327,6 +328,106 @@ func RenderTaskTree(nodes []*TaskNode, prefix string, spin spinner.Model, isLoad
 		}
 	}
 	return sb.String()
+}
+
+func RenderInlineTool(node *TaskNode, prefix, connector string, spin spinner.Model) string {
+	icon := "○"
+	s := style.TreeStyle
+	textStyle := style.SystemStyle // Default dim
+
+	switch node.Status {
+	case "running":
+		icon = spin.View()
+		s = style.TreeActiveStyle
+		textStyle = style.UserStyle // Highlight running
+	case "completed", "done":
+		icon = "✓"
+		s = lipgloss.NewStyle().Foreground(style.Green)
+		textStyle = style.SystemStyle // Dim completed inline tools to reduce noise
+	case "failed":
+		icon = "x"
+		s = style.ErrorStyle
+	}
+
+	meta := ""
+	if node.Meta != "" {
+		meta = " " + style.MetaStyle.Render(node.Meta)
+	}
+
+	// Format: [Prefix][Connector][Icon] [Badge] [Name] [Meta]
+	badge := ""
+	if node.AgentName != "" {
+		bg := lipgloss.Color(node.AgentColor)
+		if node.AgentColor == "" {
+			bg = style.BurntOrange // Default fallback
+		}
+		badgeStyle := lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#FFFFFF")).
+			Background(bg).
+			Padding(0, 1).
+			Bold(true).
+			MarginRight(1)
+		badge = badgeStyle.Render(node.AgentName)
+	}
+
+	return fmt.Sprintf("%s%s%s %s%s%s\n",
+		style.SystemStyle.Render(prefix),
+		style.SystemStyle.Render(connector),
+		s.Render(icon),
+		badge,
+		textStyle.Render(node.Name),
+		meta,
+	)
+}
+
+func RenderBlockTool(node *TaskNode, prefix, connector string, spin spinner.Model) string {
+	// Block tools get a more prominent header
+	// [Prefix][Connector] [Icon] [Name]
+
+	icon := "□" // Box icon for blocks
+	s := style.TreeStyle
+	textStyle := style.UserStyle // Blocks are usually important
+
+	switch node.Status {
+	case "running":
+		icon = spin.View()
+		s = style.TreeActiveStyle
+	case "completed", "done":
+		icon = "■"
+		s = lipgloss.NewStyle().Foreground(style.Green)
+	case "failed":
+		icon = "x"
+		s = style.ErrorStyle
+	}
+
+	meta := ""
+	if node.Meta != "" {
+		meta = " " + style.MetaStyle.Render(node.Meta)
+	}
+
+	badge := ""
+	if node.AgentName != "" {
+		bg := lipgloss.Color(node.AgentColor)
+		if node.AgentColor == "" {
+			bg = style.BurntOrange
+		}
+		badgeStyle := lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#FFFFFF")).
+			Background(bg).
+			Padding(0, 1).
+			Bold(true).
+			MarginRight(1)
+		badge = badgeStyle.Render(node.AgentName)
+	}
+
+	return fmt.Sprintf("%s%s%s %s%s%s\n",
+		style.SystemStyle.Render(prefix),
+		style.SystemStyle.Render(connector),
+		s.Render(icon),
+		badge,
+		textStyle.Render(node.Name),
+		meta,
+	)
 }
 
 func RenderStatusBar(m Model) string {
@@ -475,4 +576,108 @@ func truncateString(s string, maxLen int) string {
 		return s
 	}
 	return s[:maxLen] + "... (truncated)"
+}
+
+// RenderTaskDashboard renders the "Master Plan" roadmap above the logs
+func RenderTaskDashboard(m Model) string {
+	w := m.TerminalWidth - 4 // Padding
+	if w < 10 {
+		return ""
+	}
+
+	pm := m.Controller.GetPlanManager()
+	if pm == nil || len(pm.GetTasks()) == 0 {
+		return "" // No tasks, hide dashboard
+	}
+
+	tasks := pm.GetTasks()
+
+	// Box Style
+	boxStyle := style.BoxStyle.
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(style.BurntOrange).
+		Width(w).
+		Padding(0, 1)
+
+	var sb strings.Builder
+	sb.WriteString(style.HeaderLabelStyle.Render("🧭 SWARM MISSION CONTROL") + "\n\n")
+
+	for _, task := range tasks {
+		icon := "[ ]"
+		lineColor := style.SystemStyle
+		statusText := ""
+
+		// Check for active assignments in m.Tasks
+		activeProg := m.Tasks[task.Title]
+
+		// Determine visual state
+		switch task.Status {
+		case "done", "completed":
+			icon = "[✓]"
+			lineColor = lipgloss.NewStyle().Foreground(style.Green)
+			statusText = lineColor.Render("(Completed)")
+
+		case "active", "in_progress", "running":
+			icon = "[⠋]"
+			// If we have an active agent, show it
+			if activeProg != nil && activeProg.AgentIdentifier != "" {
+				badge := lipgloss.NewStyle().
+					Foreground(lipgloss.Color("#000000")).
+					Background(lipgloss.Color(activeProg.AgentColor)).
+					Bold(true).
+					Padding(0, 1).
+					Render(activeProg.AgentIdentifier)
+				statusText = badge
+			} else {
+				statusText = style.ActStyle.Render("(Running)")
+			}
+			lineColor = style.ActStyle // Highlight active task title
+			// Use the model's spinner for animation?
+			// We can't easily animate the text string here without state,
+			// so we use a static char or simply depend on redraws.
+			// The user asked for a spinner, but a text spinner requires frame tracking.
+			// View() is re-called on tick, so if we use m.Spinner.View() it will animate!
+			if m.IsLoading {
+				icon = fmt.Sprintf("[%s]", m.Spinner.View())
+			}
+
+		case "failed":
+			icon = "[x]"
+			lineColor = style.ErrorStyle
+			statusText = style.ErrorStyle.Render("(Failed)")
+
+		case "pending":
+			// Check blockage
+			if len(task.Dependencies) > 0 {
+				icon = "[🔒]"
+				lineColor = lipgloss.NewStyle().Foreground(lipgloss.Color("#555555")) // Dim
+				// Find dependency names/IDs
+				deps := strings.Join(task.Dependencies, ", ")
+				statusText = lineColor.Render(fmt.Sprintf("(waits for #%s)", deps))
+			} else {
+				icon = "[ ]"
+				lineColor = style.SystemStyle
+			}
+		}
+
+		// Render Line: [Icon] ID. Title ........ [Status/Badge]
+		// Truncate title if needed
+		title := task.Title
+
+		// Calculate padding for right-alignment of status
+		// This is tricky with simple string builder, so we just append.
+
+		row := fmt.Sprintf("%s %s. %s", lineColor.Render(icon), task.ID, lineColor.Render(title))
+
+		// Pad with dots? "Title ............ [Badge]"
+		if statusText != "" {
+			// Naive padding
+			// Just space it out a bit
+			row += fmt.Sprintf(" %s", statusText)
+		}
+
+		sb.WriteString(row + "\n")
+	}
+
+	return boxStyle.Render(sb.String())
 }

@@ -2,6 +2,7 @@ package safeguard
 
 import (
 	"fmt"
+	"path/filepath"
 
 	"github.com/igoryan-dao/ricochet/internal/config"
 	"github.com/igoryan-dao/ricochet/internal/paths"
@@ -12,8 +13,10 @@ import (
 type Manager struct {
 	gitManager      *checkpoint.GitManager
 	PermissionStore *PermissionStore
+	Permissions     *PermissionConfig // Loaded from .ricochet/permissions.yaml
 	CurrentZone     TrustZone
 	AutoApproval    *config.AutoApprovalSettings
+	ToolsSettings   *config.ToolsSettings
 }
 
 // NewManager creates a new safeguard manager
@@ -40,9 +43,23 @@ func NewManager(cwd string) (*Manager, error) {
 		return nil, fmt.Errorf("failed to create permission store: %w", err)
 	}
 
+	// Load file/tool/command permissions
+	permConfig, err := LoadConfig(cwd)
+	if err != nil {
+		// Log warning but continue with defaults if config fails?
+		// Better to fail closed or warn. Let's warn and use safe defaults.
+		// For now, simple return for MVP.
+		// Actually, LoadConfig returns safe defaults if file not found.
+		// If error is parsing, we should probably fail.
+		if permConfig == nil {
+			permConfig, _ = LoadConfig(cwd) // Retry or use empty? LoadConfig handles default.
+		}
+	}
+
 	return &Manager{
 		gitManager:      gitMgr,
 		PermissionStore: permStore,
+		Permissions:     permConfig,
 		CurrentZone:     ZoneSafe, // Default to Safe Zone
 	}, nil
 }
@@ -50,6 +67,11 @@ func NewManager(cwd string) (*Manager, error) {
 // SetAutoApproval updates the auto-approval settings
 func (m *Manager) SetAutoApproval(settings *config.AutoApprovalSettings) {
 	m.AutoApproval = settings
+}
+
+// SetToolsSettings updates the tools settings
+func (m *Manager) SetToolsSettings(settings *config.ToolsSettings) {
+	m.ToolsSettings = settings
 }
 
 // CreateCheckpoint creates a checkpoint of the current state
@@ -90,6 +112,80 @@ func (m *Manager) CheckPermission(tool string) error {
 	}
 
 	return CheckZonePermission(m.CurrentZone, tool)
+}
+
+// CheckFileAccess verifies if file access is allowed based on glob rules
+func (m *Manager) CheckFileAccess(path string, write bool) error {
+	// 1. Check if allowed
+	allowed := false
+	for _, pattern := range m.Permissions.Files.Allow {
+		// Special handling for recursive allow-all
+		if pattern == "**" {
+			allowed = true
+			break
+		}
+
+		if matched, _ := filepath.Match(pattern, path); matched {
+			allowed = true
+			break
+		}
+	}
+
+	if !allowed {
+		return fmt.Errorf("access denied: path '%s' does not match any allow pattern", path)
+	}
+
+	// 2. Check if denied (Explicit Deny trumps Allow)
+	for _, pattern := range m.Permissions.Files.Deny {
+		if matched, _ := filepath.Match(pattern, path); matched {
+			return fmt.Errorf("access denied: path '%s' matches deny pattern '%s'", path, pattern)
+		}
+	}
+
+	return nil
+}
+
+// CheckCommand verifies if a shell command is allowed
+func (m *Manager) CheckCommand(command string) error {
+	// Simple prefix match or exact match for now
+	// Real implementation needs shell tokenization to check executable.
+
+	// 1. Check Allow
+	allowed := false
+	for _, pattern := range m.Permissions.Commands.Allow {
+		if pattern == "*" || pattern == command {
+			allowed = true
+			break
+		}
+		// Prefix check
+		if len(pattern) > 0 && pattern[len(pattern)-1] == '*' {
+			prefix := pattern[:len(pattern)-1]
+			if len(command) >= len(prefix) && command[:len(prefix)] == prefix {
+				allowed = true
+				break
+			}
+		}
+	}
+
+	if !allowed {
+		return fmt.Errorf("command denied: '%s' not in allow list", command)
+	}
+
+	// 2. Check Deny
+	for _, pattern := range m.Permissions.Commands.Deny {
+		if pattern == command {
+			return fmt.Errorf("command explicitly denied: '%s'", command)
+		}
+		// Prefix check
+		if len(pattern) > 0 && pattern[len(pattern)-1] == '*' {
+			prefix := pattern[:len(pattern)-1]
+			if len(command) >= len(prefix) && command[:len(prefix)] == prefix {
+				return fmt.Errorf("command denied by pattern '%s'", pattern)
+			}
+		}
+	}
+
+	return nil
 }
 
 // Helper to check if a command is generally safe (simple heuristic)

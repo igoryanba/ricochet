@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/google/uuid"
 	"github.com/igoryan-dao/ricochet/internal/protocol"
 )
 
@@ -18,13 +19,15 @@ const defaultOpenAIURL = "https://api.openai.com/v1/chat/completions"
 
 // OpenAIProvider implements Provider for OpenAI and compatible APIs (OpenRouter)
 type OpenAIProvider struct {
-	apiKey  string
-	model   string
-	baseURL string
+	apiKey       string
+	model        string
+	baseURL      string
+	organization string
+	project      string
 }
 
 // NewOpenAIProvider creates a new OpenAI-compatible provider
-func NewOpenAIProvider(apiKey, model, baseURL string) *OpenAIProvider {
+func NewOpenAIProvider(apiKey, model, baseURL, organization, project string) *OpenAIProvider {
 	if model == "" {
 		model = "gpt-4o"
 	}
@@ -37,9 +40,11 @@ func NewOpenAIProvider(apiKey, model, baseURL string) *OpenAIProvider {
 		}
 	}
 	return &OpenAIProvider{
-		apiKey:  apiKey,
-		model:   model,
-		baseURL: baseURL,
+		apiKey:       apiKey,
+		model:        model,
+		baseURL:      baseURL,
+		organization: organization,
+		project:      project,
 	}
 }
 
@@ -118,11 +123,18 @@ func (p *OpenAIProvider) Chat(ctx context.Context, req *ChatRequest) (*ChatRespo
 		return nil, fmt.Errorf("marshal request: %w", err)
 	}
 
-	resp, err := doRequest(ctx, "POST", p.baseURL, p.headers(), bytes.NewReader(body))
+	requestID := uuid.New().String()
+	headers := p.headers()
+	headers["X-Client-Request-Id"] = requestID
+
+	resp, err := doRequest(ctx, "POST", p.baseURL, headers, bytes.NewReader(body))
 	if err != nil {
 		return nil, fmt.Errorf("request failed: %w", err)
 	}
 	defer resp.Body.Close()
+
+	// Log debugging info
+	log.Printf("[OpenAI] Request %s: Status %d, X-Request-Id: %s", requestID, resp.StatusCode, resp.Header.Get("X-Request-Id"))
 
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
@@ -201,11 +213,18 @@ func (p *OpenAIProvider) ChatStream(ctx context.Context, req *ChatRequest, callb
 		return fmt.Errorf("marshal request: %w", err)
 	}
 
-	resp, err := doRequest(ctx, "POST", p.baseURL, p.headers(), bytes.NewReader(body))
+	requestID := uuid.New().String()
+	headers := p.headers()
+	headers["X-Client-Request-Id"] = requestID
+
+	resp, err := doRequest(ctx, "POST", p.baseURL, headers, bytes.NewReader(body))
 	if err != nil {
 		return fmt.Errorf("request failed: %w", err)
 	}
 	defer resp.Body.Close()
+
+	// Log debugging info
+	log.Printf("[OpenAI] Stream Request %s: Status %d, X-Request-Id: %s", requestID, resp.StatusCode, resp.Header.Get("X-Request-Id"))
 
 	if resp.StatusCode != http.StatusOK {
 		respBody, _ := io.ReadAll(resp.Body)
@@ -219,6 +238,13 @@ func (p *OpenAIProvider) headers() map[string]string {
 	headers := map[string]string{
 		"Content-Type":  "application/json",
 		"Authorization": "Bearer " + p.apiKey,
+	}
+
+	if p.organization != "" {
+		headers["OpenAI-Organization"] = p.organization
+	}
+	if p.project != "" {
+		headers["OpenAI-Project"] = p.project
 	}
 
 	// OpenRouter specific headers

@@ -78,5 +78,28 @@ func (p *InjectionProcessor) Process(input string) (string, []string) {
 		infoMessages = append(infoMessages, fmt.Sprintf("🖥️ Injected command output: !{%s}", cmdStr))
 	}
 
+	// 3. Smart Triggers (Phase 17)
+	// Trigger: "test" or "fail" -> Suggest running tests
+	if strings.Contains(strings.ToLower(input), "test") || strings.Contains(strings.ToLower(input), "fail") {
+		// Just a hint for now. In future, we could look for test files.
+		// infoMessages = append(infoMessages, "💡 Tip: You can run tests using `go test ./...` or `npm test`.")
+	}
+
+	// Trigger: "deploy" -> Look for deploy docs
+	if strings.Contains(strings.ToLower(input), "deploy") {
+		// Quick check for standard deploy docs
+		docs := []string{"docs/deploy.md", "DEPLOY.md", "deployment.md"}
+		for _, doc := range docs {
+			if _, err := os.Stat(doc); err == nil {
+				// Inject it!
+				content, _ := os.ReadFile(doc)
+				injection := fmt.Sprintf("\n\n---\n**Auto-Injected Context (@%s):**\n```\n%s\n```\n---", doc, string(content))
+				result += injection
+				infoMessages = append(infoMessages, fmt.Sprintf("📖 Found deployment docs: %s", doc))
+				break // Only one
+			}
+		}
+	}
+
 	return result, infoMessages
 }

@@ -15,7 +15,9 @@ import (
 	"github.com/igoryan-dao/ricochet/internal/host"
 	"github.com/igoryan-dao/ricochet/internal/index"
 	mcpHubPkg "github.com/igoryan-dao/ricochet/internal/mcp"
+	"github.com/igoryan-dao/ricochet/internal/memory"
 	"github.com/igoryan-dao/ricochet/internal/modes"
+	"github.com/igoryan-dao/ricochet/internal/protocol"
 	"github.com/igoryan-dao/ricochet/internal/safeguard"
 	"github.com/igoryan-dao/ricochet/internal/workflow"
 )
@@ -41,16 +43,22 @@ type LiveModeProvider interface {
 
 // NativeExecutor implements Executor using a Host for OS operations and ModeManager for permissions
 type NativeExecutor struct {
-	host           host.Host
-	modes          *modes.Manager
-	safeguard      *safeguard.Manager
-	browser        *browser.BrowserManager
-	mcpHub         *mcpHubPkg.Hub
-	indexer        *index.Indexer
-	codegraph      *codegraph.Service
-	workflows      *workflow.Manager
-	livemode       LiveModeProvider
-	shadowVerifier *safeguard.ShadowVerifier
+	host            host.Host
+	modes           *modes.Manager
+	safeguard       *safeguard.Manager
+	browser         *browser.BrowserManager
+	mcpHub          *mcpHubPkg.Hub
+	indexer         *index.Indexer
+	codegraph       *codegraph.Service
+	workflows       *workflow.Manager
+	livemode        LiveModeProvider
+	shadowVerifier  *safeguard.ShadowVerifier
+	ptyManager      *host.PTYManager
+	memory          *memory.Manager
+	dynamicTools    map[string]ToolDefinition // Support for dynamic tools (e.g. subtask)
+	dynamicHandlers map[string]interface {
+		Execute(context.Context, json.RawMessage) (string, error)
+	}
 }
 
 func NewNativeExecutor(h host.Host, m *modes.Manager, sg *safeguard.Manager, mcpHub *mcpHubPkg.Hub, idx *index.Indexer, cg *codegraph.Service, wm *workflow.Manager) *NativeExecutor {
@@ -64,7 +72,27 @@ func NewNativeExecutor(h host.Host, m *modes.Manager, sg *safeguard.Manager, mcp
 		codegraph:      cg,
 		workflows:      wm,
 		shadowVerifier: safeguard.NewShadowVerifier(),
+		ptyManager:     host.NewPTYManager(),
+		memory:         mustCreateMemory(h.GetCWD()),
+		dynamicTools:   make(map[string]ToolDefinition),
+		dynamicHandlers: make(map[string]interface {
+			Execute(context.Context, json.RawMessage) (string, error)
+		}),
 	}
+}
+
+// RegisterTool allows registering implementation-specific tools at runtime
+func (e *NativeExecutor) RegisterTool(t interface {
+	Definition() protocol.Tool
+	Execute(context.Context, json.RawMessage) (string, error)
+}) {
+	def := t.Definition()
+	e.dynamicTools[def.Name] = ToolDefinition{
+		Name:        def.Name,
+		Description: def.Description,
+		InputSchema: def.InputSchema,
+	}
+	e.dynamicHandlers[def.Name] = t
 }
 
 // SetLiveMode sets the live mode provider for remote approval routing
@@ -184,7 +212,27 @@ func (e *NativeExecutor) Execute(ctx context.Context, name string, args json.Raw
 
 	case "execute_python":
 		return e.ExecutePythonTool(ctx, args)
+
+	case "create_checkpoint":
+		return e.CreateCheckpoint(args)
+
+	case "start_terminal":
+		return e.StartTerminal(ctx, args)
+	case "send_input":
+		return e.SendTerminalInput(ctx, args)
+	case "read_terminal":
+		return e.ReadTerminalOutput(ctx, args)
+	case "remember":
+		return e.Remember(ctx, args)
+	case "recall":
+		return e.Recall(ctx, args)
+
 	default:
+		// Check Dynamic Tools (Subtasks etc)
+		if handler, ok := e.dynamicHandlers[name]; ok {
+			return handler.Execute(ctx, args)
+		}
+
 		// Check MCP tools
 		if e.mcpHub != nil {
 			// argsMap is already parsed above if successful, or we re-parse
@@ -499,7 +547,8 @@ func (e *NativeExecutor) GetDefinitions() []ToolDefinition {
 	})
 
 	// Add Task Workspace tools
-	defs = append(defs, StartTaskTool, TaskBoundaryTool, UpdatePlanTool)
+	// StartSwarmTool and UpdatePlanTool are registered dynamically in Controller, so we don't add them here to avoid duplicates.
+	defs = append(defs, StartTaskTool, TaskBoundaryTool)
 
 	// Add browser tools
 	defs = append(defs, ToolDefinition{
@@ -564,7 +613,196 @@ func (e *NativeExecutor) GetDefinitions() []ToolDefinition {
 		}
 	}
 
+	// Add Dynamic Tools
+	for _, tool := range e.dynamicTools {
+		defs = append(defs, tool)
+	}
+
+	// Add Terminal Tools (Phase 12)
+	defs = append(defs, ToolDefinition{
+		Name:        "start_terminal",
+		Description: "Start a persistent terminal session (PTY). Use this for interactive commands or multiple commands in the same shell (retains env/alias).",
+		InputSchema: map[string]interface{}{
+			"type": "object",
+			"properties": map[string]interface{}{
+				"command": map[string]interface{}{"type": "string", "description": "Command to start (e.g. /bin/zsh, python3, top). Default: /bin/sh"},
+				"cwd":     map[string]interface{}{"type": "string", "description": "Working directory"},
+			},
+		},
+	}, ToolDefinition{
+		Name:        "send_input",
+		Description: "Send text input to a running terminal session.",
+		InputSchema: map[string]interface{}{
+			"type": "object",
+			"properties": map[string]interface{}{
+				"id":   map[string]interface{}{"type": "string", "description": "Terminal ID"},
+				"text": map[string]interface{}{"type": "string", "description": "Text to send (e.g. 'ls\\n')"},
+			},
+			"required": []string{"id", "text"},
+		},
+	}, ToolDefinition{
+		Name:        "read_terminal",
+		Description: "Read output from a terminal session.",
+		InputSchema: map[string]interface{}{
+			"type": "object",
+			"properties": map[string]interface{}{
+				"id": map[string]interface{}{"type": "string", "description": "Terminal ID"},
+			},
+			"required": []string{"id"},
+		},
+	}, ToolDefinition{
+		Name:        "create_checkpoint",
+		Description: "Create a backup checkpoint of the entire workspace. Use before making risky changes.",
+		InputSchema: map[string]interface{}{
+			"type": "object",
+			"properties": map[string]interface{}{
+				"message": map[string]interface{}{"type": "string", "description": "Reason for checkpoint"},
+			},
+			"required": []string{"message"},
+		},
+	})
+
+	// Add Memory Tools (Phase 15)
+	defs = append(defs, ToolDefinition{
+		Name:        "remember",
+		Description: "Store a permanent fact or lesson learned in the project memory.",
+		InputSchema: map[string]interface{}{
+			"type": "object",
+			"properties": map[string]interface{}{
+				"key":   map[string]interface{}{"type": "string", "description": "Key/Topic (e.g. 'deploy_cmd')"},
+				"value": map[string]interface{}{"type": "string", "description": "Information to store"},
+			},
+			"required": []string{"key", "value"},
+		},
+	}, ToolDefinition{
+		Name:        "recall",
+		Description: "Search persistent memories by query.",
+		InputSchema: map[string]interface{}{
+			"type": "object",
+			"properties": map[string]interface{}{
+				"query": map[string]interface{}{"type": "string", "description": "Search text"},
+			},
+			"required": []string{"query"},
+		},
+	})
+
 	return defs
+}
+
+// Helper for memory init
+func mustCreateMemory(cwd string) *memory.Manager {
+	m, _ := memory.NewManager(cwd) // Swallow error for MVP, just returns nil or empty
+	return m
+}
+
+func (e *NativeExecutor) Remember(ctx context.Context, args json.RawMessage) (string, error) {
+	if e.memory == nil {
+		return "", fmt.Errorf("memory manager not initialized")
+	}
+	var payload struct {
+		Key   string `json:"key"`
+		Value string `json:"value"`
+	}
+	if err := json.Unmarshal(args, &payload); err != nil {
+		return "", fmt.Errorf("invalid arguments: %w", err)
+	}
+
+	if err := e.memory.Set(payload.Key, payload.Value); err != nil {
+		return "", fmt.Errorf("failed to save memory: %w", err)
+	}
+	return fmt.Sprintf("Remembered: %s = %s", payload.Key, payload.Value), nil
+}
+
+func (e *NativeExecutor) Recall(ctx context.Context, args json.RawMessage) (string, error) {
+	if e.memory == nil {
+		return "", fmt.Errorf("memory manager not initialized")
+	}
+	var payload struct {
+		Query string `json:"query"`
+	}
+	if err := json.Unmarshal(args, &payload); err != nil {
+		return "", fmt.Errorf("invalid arguments: %w", err)
+	}
+
+	items := e.memory.Search(payload.Query, 10)
+	if len(items) == 0 {
+		return "No relevant memories found.", nil
+	}
+
+	var sb strings.Builder
+	sb.WriteString("Found memories:\n")
+	for _, item := range items {
+		sb.WriteString(fmt.Sprintf("- %s: %s\n", item.Key, item.Value))
+	}
+	return sb.String(), nil
+}
+
+func (e *NativeExecutor) StartTerminal(ctx context.Context, args json.RawMessage) (string, error) {
+	var payload struct {
+		Command string `json:"command"`
+		Cwd     string `json:"cwd"`
+	}
+	if err := json.Unmarshal(args, &payload); err != nil {
+		return "", fmt.Errorf("invalid arguments: %w", err)
+	}
+
+	cmd := payload.Command
+	if cmd == "" {
+		cmd = "/bin/sh"
+	}
+
+	cwd := payload.Cwd
+	if cwd == "" {
+		cwd = e.host.GetCWD()
+	} else {
+		cwd = filepath.Join(e.host.GetCWD(), cwd) // Resolve relative
+	}
+
+	session, err := e.ptyManager.Start(cmd, nil, cwd, nil)
+	if err != nil {
+		return "", fmt.Errorf("failed to start terminal: %w", err)
+	}
+
+	return fmt.Sprintf("Terminal started. ID: %s. Use send_input/read_terminal to interact.", session.ID), nil
+}
+
+func (e *NativeExecutor) SendTerminalInput(ctx context.Context, args json.RawMessage) (string, error) {
+	var payload struct {
+		ID   string `json:"id"`
+		Text string `json:"text"`
+	}
+	if err := json.Unmarshal(args, &payload); err != nil {
+		return "", fmt.Errorf("invalid arguments: %w", err)
+	}
+
+	err := e.ptyManager.WriteInput(payload.ID, payload.Text)
+	if err != nil {
+		return "", fmt.Errorf("failed to send input: %w", err)
+	}
+	// Auto-read after input?
+	// Let's verify output immediately for better feedback loop.
+	// Give it a tiny delay for processing?
+	// For now, return confirmation.
+	return "Input sent.", nil
+}
+
+func (e *NativeExecutor) ReadTerminalOutput(ctx context.Context, args json.RawMessage) (string, error) {
+	var payload struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(args, &payload); err != nil {
+		return "", fmt.Errorf("invalid arguments: %w", err)
+	}
+
+	output, err := e.ptyManager.ReadOutput(payload.ID)
+	if err != nil {
+		return "", fmt.Errorf("failed to read output: %w", err)
+	}
+
+	if output == "" {
+		return "(No new output)", nil
+	}
+	return output, nil
 }
 
 func (e *NativeExecutor) ExecutePythonTool(ctx context.Context, args json.RawMessage) (string, error) {
@@ -591,6 +829,26 @@ func (e *NativeExecutor) SwitchMode(args json.RawMessage) (string, error) {
 
 	mode := e.modes.GetActiveMode()
 	return fmt.Sprintf("Successfully switched to %s mode. Current role: %s", mode.Name, mode.RoleDefinition), nil
+}
+
+func (e *NativeExecutor) CreateCheckpoint(args json.RawMessage) (string, error) {
+	if e.safeguard == nil {
+		return "", fmt.Errorf("safeguard not initialized")
+	}
+
+	var payload struct {
+		Message string `json:"message"`
+	}
+	if err := json.Unmarshal(args, &payload); err != nil {
+		return "", fmt.Errorf("invalid arguments: %w", err)
+	}
+
+	hash, err := e.safeguard.CreateCheckpoint(payload.Message)
+	if err != nil {
+		return "", fmt.Errorf("checkpoint failed: %w", err)
+	}
+
+	return fmt.Sprintf("Checkpoint created. Hash: %s", hash), nil
 }
 
 func (e *NativeExecutor) RestoreCheckpoint(args json.RawMessage) (string, error) {

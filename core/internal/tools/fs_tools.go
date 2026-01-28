@@ -54,6 +54,13 @@ func (e *NativeExecutor) ReadFile(args json.RawMessage) (string, error) {
 		return "", fmt.Errorf("invalid arguments: %w", err)
 	}
 
+	// Granular Check (Phase 13)
+	if e.safeguard != nil && e.safeguard.Permissions != nil {
+		if err := e.safeguard.CheckFileAccess(payload.Path, false); err != nil {
+			return "", fmt.Errorf("safeguard: %w", err)
+		}
+	}
+
 	content, err := e.host.ReadFile(payload.Path)
 	if err != nil {
 		return "", fmt.Errorf("read file: %w", err)
@@ -78,21 +85,20 @@ func (e *NativeExecutor) WriteFile(ctx context.Context, args json.RawMessage) (s
 	absPath, _ := e.resolvePath(payload.Path)
 	if _, err := os.Stat(absPath); err == nil {
 		if !payload.Overwrite {
-			return "", fmt.Errorf("❌ BLOCKED: File '%s' already exists.\n\n"+
-				"🚫 write_file is ONLY for creating NEW files.\n"+
-				"✅ Use 'replace_file_content' tool to edit existing files.\n\n"+
-				"Why? replace_file_content:\n"+
-				"- Shows diff to user (green/red lines)\n"+
-				"- Creates checkpoints for undo\n"+
-				"- Preserves edit history\n\n"+
-				"write_file destroys all of this.\n\n"+
-				"FORCE OVERWRITE: If you are SURE you want to overwrite (e.g. config files), set `overwrite: true`.", payload.Path)
+			return "", fmt.Errorf("ERROR: File exists. STOP. Do not try to write this file again. Use replace_file_content OR skip this step.")
 		}
 	}
 
 	// Dynamic Mode check
 	if allowed, msg := e.modes.CanAccessFile(payload.Path); !allowed {
 		return "", fmt.Errorf("permission denied: %s", msg)
+	}
+
+	// Granular Check (Phase 13)
+	if e.safeguard != nil && e.safeguard.Permissions != nil {
+		if err := e.safeguard.CheckFileAccess(payload.Path, true); err != nil {
+			return "", fmt.Errorf("safeguard: %w", err)
+		}
 	}
 
 	// INTERACTIVE CONSENT (Phase 11)
@@ -119,7 +125,12 @@ func (e *NativeExecutor) WriteFile(ctx context.Context, args json.RawMessage) (s
 
 	// PHASE 11: Shadow Workspace (Linter Loop)
 	// Verify the written file immediately
-	if e.shadowVerifier != nil {
+	bypassCorrection := false
+	if e.safeguard != nil && e.safeguard.ToolsSettings != nil {
+		bypassCorrection = e.safeguard.ToolsSettings.DisableLLMCorrection
+	}
+
+	if e.shadowVerifier != nil && !bypassCorrection {
 		if err := e.shadowVerifier.Verify(ctx, payload.Path); err != nil {
 			// We return an error to force the agent to fix it.
 			// But we clarify that the file WAS written.
@@ -299,6 +310,13 @@ func (e *NativeExecutor) ReplaceFileContent(ctx context.Context, args json.RawMe
 	// Dynamic Mode check
 	if allowed, msg := e.modes.CanAccessFile(payload.Path); !allowed {
 		return "", fmt.Errorf("permission denied: %s", msg)
+	}
+
+	// Granular Check (Phase 13)
+	if e.safeguard != nil && e.safeguard.Permissions != nil {
+		if err := e.safeguard.CheckFileAccess(payload.Path, true); err != nil {
+			return "", fmt.Errorf("safeguard: %w", err)
+		}
 	}
 
 	// Verify file exists and read it

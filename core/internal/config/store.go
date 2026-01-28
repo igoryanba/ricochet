@@ -35,7 +35,12 @@ type AutoApprovalSettings struct {
 	EnableNotifications bool `json:"enable_notifications"`  // Enable system notifications
 }
 
+type ToolsSettings struct {
+	DisableLLMCorrection bool `json:"disable_llm_correction"`
+}
+
 type Settings struct {
+	Tools        ToolsSettings        `json:"tools"`
 	Provider     ProviderSettings     `json:"provider"`
 	LiveMode     LiveModeSettings     `json:"live_mode"`
 	Context      ContextSettings      `json:"context"`
@@ -57,6 +62,8 @@ type LiveModeSettings struct {
 	TelegramToken  string  `json:"telegram_token"`
 	TelegramChatID int64   `json:"telegram_chat_id"`
 	AllowedUserIDs []int64 `json:"allowed_user_ids"`
+	WhisperBinary  string  `json:"whisper_binary,omitempty"` // Path to whisper executable
+	WhisperModel   string  `json:"whisper_model,omitempty"`  // Path to ggml model
 }
 
 type Store struct {
@@ -127,6 +134,9 @@ func NewStore() (*Store, error) {
 				ExecuteAllCommands:  false, // Unsafe: any command needs approval
 				UseBrowser:          false, // Disabled by default
 				UseMCP:              true,  // MCP tools are generally safe
+			},
+			Tools: ToolsSettings{
+				DisableLLMCorrection: false, // Default enabled
 			},
 			Theme: "dark",
 		},

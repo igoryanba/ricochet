@@ -67,7 +67,7 @@ var TaskBoundaryTool = ToolDefinition{
 // UpdatePlanTool updates the persistent task list (PlanManager)
 var UpdatePlanTool = ToolDefinition{
 	Name:        "update_plan",
-	Description: "Update the status of a task in the Master Plan. Use this to mark tasks as 'active' (when you start working on them) or 'done' (when completed).",
+	Description: "Update the status of a task in the Master Plan. Use this to mark tasks as 'active' or 'done', and set dependencies.",
 	InputSchema: map[string]interface{}{
 		"type": "object",
 		"properties": map[string]interface{}{
@@ -80,8 +80,29 @@ var UpdatePlanTool = ToolDefinition{
 				"enum":        []string{"pending", "active", "done", "failed"},
 				"description": "The new status of the task",
 			},
+			"dependencies": map[string]interface{}{
+				"type":        "array",
+				"items":       map[string]interface{}{"type": "string"},
+				"description": "List of task IDs that must complete before this task starts.",
+			},
 		},
 		"required": []string{"task_id", "status"},
+	},
+}
+
+// StartSwarmTool activates the parallel execution engine
+var StartSwarmTool = ToolDefinition{
+	Name:        "start_swarm",
+	Description: "REQUIRED: Activate Swarm Mode. Use THIS TOOL to start the swarm. \n⚠️ DO NOT RUN CLI COMMANDS like './ricochet swarm start'. They do not exist and will fail. \nThe agent will analyze the Master Plan dependency graph and spawn sub-agents for all 'runnable' tasks in parallel.",
+	InputSchema: map[string]interface{}{
+		"type": "object",
+		"properties": map[string]interface{}{
+			"confirm": map[string]interface{}{
+				"type":        "boolean",
+				"description": "Set to true to confirm swarm activation.",
+			},
+		},
+		"required": []string{"confirm"},
 	},
 }
 

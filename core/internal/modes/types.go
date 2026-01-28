@@ -85,7 +85,7 @@ var ToolGroupDefinitions = map[string][]string{
 	"command": {"execute_command", "command_status"},
 	"browser": {"browser_open", "browser_screenshot", "browser_click", "browser_type"},
 	"mcp":     {"use_mcp_tool", "access_mcp_resource"}, // Placeholder for MCP
-	"always":  {"switch_mode", "update_todos", "restore_checkpoint", "task_boundary"},
+	"always":  {"switch_mode", "update_todos", "restore_checkpoint", "task_boundary", "start_swarm", "update_plan", "start_task", "notify_user"},
 }
 
 func IsToolAllowed(mode Mode, toolName string) bool {

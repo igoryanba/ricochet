@@ -8,6 +8,7 @@ import (
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/glamour"
+	"github.com/charmbracelet/lipgloss"
 	"github.com/muesli/termenv"
 
 	"github.com/igoryan-dao/ricochet/internal/agent"
@@ -83,15 +84,17 @@ type RemoteChatMsg struct {
 type DemoUpdateMsg func(*Model)
 
 type TaskNode struct {
-	ID       string
-	ParentID string
-	Name     string
-	Status   string // "running", "done", "failed"
-	Children []*TaskNode
-	Meta     string // e.g. "19 tools used"
-	Result   string // Tool output (for terminal block)
-	Expanded bool
-	Depth    int
+	ID         string
+	ParentID   string
+	Name       string
+	Status     string // "running", "done", "failed"
+	Children   []*TaskNode
+	Meta       string // e.g. "19 tools used"
+	Result     string // Tool output (for terminal block)
+	Expanded   bool
+	Depth      int
+	AgentName  string // e.g. "ARCH", "QA"
+	AgentColor string // Hex color
 }
 
 // -- Interleaved Blocks Architecture --
@@ -115,13 +118,6 @@ type HistoryBlock struct {
 
 // -- Model --
 
-type DisplayMessage struct {
-	Role      string
-	Content   string
-	Reasoning string // DeepSeek reasoning content
-	Style     string // "user", "agent", "system", "error", "task"
-}
-
 type Model struct {
 	Cwd        string
 	Controller *agent.Controller
@@ -133,7 +129,6 @@ type Model struct {
 	Textarea  textarea.Model
 	Spinner   spinner.Model
 	IsLoading bool
-	Messages  []DisplayMessage
 	Thoughts  string
 
 	// Styling
@@ -144,15 +139,20 @@ type Model struct {
 	PendingChoice   *AskUserChoiceMsg
 	ConfirmationIdx int
 
-	// Task Tree (LEGACY - kept for backward compatibility, use Blocks instead)
-	TaskTree []*TaskNode
-
 	// Interleaved Blocks (Claude Code-style rendering)
 	// Each block is either User Query, Agent Text, or Agent Tree
+	// This is now the Single Source of Truth for history.
 	Blocks []*HistoryBlock
 
+	// Deduplication State
+	// Tracks how many steps have been rendered for each TaskName to prevent "Snowball Effect"
+	RenderedSteps map[string]int
+
 	// Modes
-	IsPlanMode bool
+	IsPlanMode     bool
+	PlanCursor     int  // Index of selected task in plan view
+	PlanAddingTask bool // True if typing new task
+	IsShellFocused bool // Tab toggles between Input and Shell (Viewport) focus
 
 	// Task Progress (Legacy map - might deplete in favor of Tree, but keeping for compatibility)
 	Tasks map[string]*protocol.TaskProgress
@@ -196,10 +196,17 @@ func NewModel(cwd, modelName string, msgChan chan tea.Msg, ctrl *agent.Controlle
 	ta := textarea.New()
 	ta.Placeholder = "Ask Ricochet..."
 	ta.Focus()
-	ta.Prompt = "┃ "
+	ta.Prompt = "" // Removed vertical bar
 	ta.CharLimit = 0
-	ta.SetHeight(3)
+	ta.SetHeight(1) // Start with 1 line
 	ta.ShowLineNumbers = false
+
+	// Custom Styles to remove black background artifact
+	// bubbles v0.21.0 uses FocusedStyle/BlurredStyle
+	ta.FocusedStyle.Placeholder = ta.FocusedStyle.Placeholder.Background(lipgloss.NoColor{}).Foreground(style.MutedGray)
+	ta.BlurredStyle.Placeholder = ta.BlurredStyle.Placeholder.Background(lipgloss.NoColor{}).Foreground(style.MutedGray)
+	ta.FocusedStyle.CursorLine = ta.FocusedStyle.CursorLine.Background(lipgloss.NoColor{})
+	ta.BlurredStyle.CursorLine = ta.BlurredStyle.CursorLine.Background(lipgloss.NoColor{})
 
 	vp := viewport.New(80, 20)
 	// Welcome content will be set in Init or View, or we can helper it here.
@@ -213,8 +220,8 @@ func NewModel(cwd, modelName string, msgChan chan tea.Msg, ctrl *agent.Controlle
 
 	// Initial commands list
 	cmds := []string{
-		"/help", "/status", "/checkpoint", "/restore", "/init", "/shell",
-		"/memory", "/hooks", "/clear", "/mode", "/exit", "/ether", "/permissions", // Added /permissions
+		"/help", "/model", "/status", "/checkpoint", "/restore", "/init", "/shell",
+		"/memory", "/hooks", "/clear", "/mode", "/exit", "/ether", "/permissions",
 	}
 
 	// Generate Welcome Content (Plain Text to prevent ALL artifacts)
@@ -245,17 +252,27 @@ Type ? for shortcuts.
 		Spinner:     sp,
 		Renderer:    renderer,
 		AllCommands: cmds,
-		Messages:    []DisplayMessage{{Role: "system", Content: welcome, Style: "system"}},
-		Tasks:       make(map[string]*protocol.TaskProgress),
 
-		// Default to Planning Mode to match Agent's Architect persona
-		IsPlanMode: true,
+		// Blocks initialized with welcome message
+		Blocks: []*HistoryBlock{
+			{
+				Type:    BlockAgentText,
+				Content: welcome,
+			},
+		},
+
+		RenderedSteps: make(map[string]int),
+		Tasks:         make(map[string]*protocol.TaskProgress),
+
+		// Default to Chat Mode
+		IsPlanMode: false,
 	}
 }
 
 func (m Model) Init() tea.Cmd {
 	return tea.Batch(
 		textarea.Blink,
+		tea.EnableMouseCellMotion, // Enable mouse support for scrolling
 		m.Spinner.Tick,
 		m.waitForMsg(),
 	)

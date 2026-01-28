@@ -5,7 +5,7 @@ package agent
 // NewXAIProvider creates a new xAI provider
 // xAI uses OpenAI-compatible API, so we reuse OpenAIProvider with custom baseURL
 func NewXAIProvider(apiKey, model string) Provider {
-	return NewOpenAIProvider(apiKey, model, "https://api.x.ai/v1")
+	return NewOpenAIProvider(apiKey, model, "https://api.x.ai/v1", "", "")
 }
 
 // XAI model definitions for reference
