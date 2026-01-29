@@ -58,6 +58,10 @@ Ricochet is developed solo and is completely open-source. If it helps you build 
     *   **USDT (SOL)**: `DAaY5J6tg6PY7M77mxpMxGFMqLsCtPRKBmgmmCS9zM5b`
     *   **USDT (ERC20)**: `0x5eB4C13497e10849724714D351C139Fc6Ab00Adc`
 
+## Star History
+
+[![Star History Chart](https://api.star-history.com/svg?repos=Grik-ai/ricochet&type=date&legend=top-left)](https://www.star-history.com/#Grik-ai/ricochet&type=date&legend=top-left)
+
 ## License
 
 Apache 2.0 © 2025 Igor Pryimak
