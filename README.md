@@ -1,8 +1,8 @@
 # Ricochet
 
 <p align="center">
-  <strong>The First Hybrid AI Coding Agent</strong><br>
-  Pair-program in VS Code or control your environment remotely via Telegram.
+  <strong>The Hybrid AI Coding Agent</strong><br>
+  Pair-program in VS Code or control your environment remotely via messengers.
 </p>
 
 <p align="center">
@@ -52,6 +52,11 @@ Ricochet is developed solo and is completely open-source. If it helps you build 
 *   **Star the Repo**: [github.com/Grik-ai/ricochet](https://github.com/Grik-ai/ricochet)
 *   **Ko-fi**: [ko-fi.com/igoryan34](https://ko-fi.com/igoryan34)
 *   **PayPal**: [Donate via PayPal](https://www.paypal.com/ncp/payment/PPMFBMFVAB8QN)
+*   **Crypto**:
+    *   **TON**: `UQB93GTsF6ZI7ljBViLr-IHIf93HpqwolC51jR5Und7GAwm4`
+    *   **USDT (TRC20)**: `TRykhiHNeXxcdmhn5DBP2GGLnKQDBVzjhB`
+    *   **USDT (SOL)**: `DAaY5J6tg6PY7M77mxpMxGFMqLsCtPRKBmgmmCS9zM5b`
+    *   **USDT (ERC20)**: `0x5eB4C13497e10849724714D351C139Fc6Ab00Adc`
 
 ## License
 
